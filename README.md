@@ -75,6 +75,9 @@ print(result)
 - время создания артефакта
 - git-ветка
 - имя функции и модуля
+- путь к исходному файлу функции
+- флаг async/sync
+- `title` снапшота
 - хэш вызова
 - роль артефакта
 - тип исключения, если вызов завершился ошибкой
@@ -90,6 +93,8 @@ blackbox(
     capture_locals=True,
     verbose=False,
     serializer="dill",
+    sanitize_hooks=None,
+    on_serialize_error="warn",
     locals_strategy="settrace",
 )
 ```
@@ -102,6 +107,8 @@ blackbox(
 - `capture_locals` — захватывать локальные переменные функции
 - `verbose` — печатать список сохраненных файлов
 - `serializer` — backend сериализации: `"dill"` или `"pickle"`
+- `sanitize_hooks` — пользовательские функции санации для нестандартных типов
+- `on_serialize_error` — поведение при проблемах сериализации: `"warn"`, `"silent"` или `"raise"`
 - `locals_strategy` — стратегия захвата локальных переменных
 
 ## Стратегии захвата locals
@@ -150,6 +157,68 @@ def add(a, b):
     return a + b
 ```
 
+## Пользовательская санация типов
+
+Если в объектном графе есть нестандартные типы, можно передать свои hook-функции
+через `sanitize_hooks`.
+
+В модуле `blackbox.io` доступен sentinel `NOT_HANDLED`, который означает:
+hook не знает, как обработать объект, и управление нужно передать дальше.
+
+```python
+from blackbox import blackbox
+from blackbox.io import NOT_HANDLED
+
+
+class MyType:
+    def __init__(self, value: int):
+        self.value = value
+
+
+def my_hook(obj, context):
+    if isinstance(obj, MyType):
+        return {
+            "type": "MyType",
+            "value": obj.value,
+            "path": context["path"],
+        }
+    return NOT_HANDLED
+
+
+@blackbox(
+    sanitize_hooks=[my_hook],
+    on_serialize_error="warn",
+)
+def build_payload():
+    return {"custom": MyType(42)}
+```
+
+`context` сейчас содержит:
+
+- `path` — путь до объекта внутри снапшота, например `output['result']['custom']`
+- `serializer` — активный backend сериализации
+
+Если объект не удалось сериализовать и ни один hook его не обработал, `blackbox`
+сохраняет fallback marker вместо падения:
+
+```python
+{
+    "__blackbox_unserializable__": True,
+    "type": "...",
+    "module": "...",
+    "repr": "...",
+    "reason": "...",
+}
+```
+
+Подробности по таким случаям записываются в:
+
+```python
+output_data["__blackbox__"]["serialization_issues"]
+```
+
+Эти проблемы не пишутся в `meta.json`, чтобы он оставался легким.
+
 ## Загрузка артефактов
 
 В модуле `blackbox.io` есть вспомогательные функции:
@@ -187,6 +256,7 @@ value_json = read_var_from_pickle(
 - `get_local_vars(...)` — список пойманных локальных переменных с типом и размером
 - `get_result(...)` — JSON-представление результата и информация об исключении
 - `read_var_from_pickle(...)` — чтение конкретной локальной переменной из `output.pkl`
+- `create_snapshot_notebook(...)` — генерация Jupyter notebook для исследования снапшота
 - `open_result_in_repl(...)` и `open_var_in_repl(...)` — быстрый экспорт значения в интерактивную сессию
 
 Helper-скрипты также можно запускать напрямую:
@@ -195,7 +265,49 @@ Helper-скрипты также можно запускать напрямую:
 python -m blackbox.helpers.get_result --pickle-path /tmp/blackbox/example.py/add/.../output.pkl
 python -m blackbox.helpers.get_local_vars --pickle-path /tmp/blackbox/example.py/add/.../output.pkl
 python -m blackbox.helpers.read_var_from_pickle --pickle-path /tmp/blackbox/example.py/add/.../output.pkl --var-name total
+python -m blackbox.helpers.create_snapshot_notebook --snapshot-path /tmp/blackbox/example.py/add/.../
+python -m blackbox.helpers.create_snapshot_notebook --snapshot-path /tmp/blackbox/example.py/add/.../ --compare-with /tmp/blackbox/example.py/add-other/.../
 ```
+
+Notebook generation:
+
+```python
+from blackbox.helpers import create_snapshot_notebook
+
+notebook_path = create_snapshot_notebook(
+    "/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34"
+)
+print(notebook_path)
+```
+
+Snapshot comparison notebook:
+
+```python
+from blackbox.helpers import create_snapshot_notebook
+
+notebook_path = create_snapshot_notebook(
+    "/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34",
+    compare_with="/tmp/blackbox/example.py/add/20260425_120301_654321_ef56ab78",
+)
+print(notebook_path)
+```
+
+The generated notebook is intended for interactive snapshot review and includes:
+
+- general snapshot information
+- loaded `args` and `kwargs`
+- loaded local variables
+- loaded result
+- loaded exception details when present
+
+When `compare_with=...` is provided, the notebook switches to compare mode and includes:
+
+- a high-level summary for both snapshots
+- source code comparison
+- side-by-side argument inspection
+- side-by-side local variable inspection
+- side-by-side result inspection
+- exception comparison when an exception exists in at least one snapshot
 
 ## Ограничения и замечания
 
@@ -213,13 +325,14 @@ from blackbox import blackbox
 Дополнительные функции чтения артефактов:
 
 ```python
-from blackbox.io import load_json, load_pickle
+from blackbox.io import NOT_HANDLED, load_json, load_pickle
 ```
 
 Высокоуровневые helper-утилиты:
 
 ```python
 from blackbox.helpers import (
+    create_snapshot_notebook,
     get_args,
     get_local_vars,
     get_result,

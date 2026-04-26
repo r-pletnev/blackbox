@@ -4,11 +4,23 @@
 Ничего не знает о декораторе и стратегиях захвата.
 """
 
+import inspect
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .io import _get_git_branch, _make_hash, _sanitize_for_pickle, _save_meta_json, _save_pickle
+from .io import (
+    _fallback_unserializable_marker,
+    _get_git_branch,
+    _issue_record,
+    _make_hash,
+    _report_issue,
+    _sanitize_for_pickle,
+    _save_meta_json,
+    _save_pickle,
+    _to_plain_data,
+    _try_serialize,
+)
 
 
 class CallArtifact:
@@ -25,20 +37,33 @@ class CallArtifact:
         save_dir: str,
         *,
         serializer: str = "dill",
+        sanitize_hooks: list | None = None,
+        on_serialize_error: str = "warn",
     ):
         base_dir = Path(save_dir)
-        source_file = Path(func.__code__.co_filename).name  # ← фикс: берём из func, не из frame
+        source_path = Path(func.__code__.co_filename).resolve()
+        source_file = source_path.name
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         call_hash = _make_hash(args, kwargs, serializer=serializer)
 
         self.call_dir = base_dir / source_file / func.__name__ / f"{timestamp}_{call_hash}"
         self.serializer = serializer
+        self.sanitize_hooks = sanitize_hooks or []
+        self.on_serialize_error = on_serialize_error
+        try:
+            function_source = inspect.getsource(func)
+        except (OSError, TypeError):
+            function_source = None
+        self.func = func
         self.meta = {
             "function": func.__name__,
             "module": func.__module__,
             "timestamp": timestamp,
             "call_hash": call_hash,
             "serializer": serializer,
+            "source_path": str(source_path),
+            "is_async": inspect.iscoroutinefunction(func),
+            "function_source": function_source,
         }
         self.saved: list[Path] = []
 
@@ -57,10 +82,42 @@ class CallArtifact:
         locals_dict: dict | None = None,
         exc_info: Exception | None = None,
     ) -> None:
+        blackbox_meta: dict[str, Any] = {
+            "function_source": self.meta["function_source"],
+        }
+        function_issues: list[dict[str, Any]] = []
+        function_module = getattr(self.func, "__module__", None)
+        if function_module == "__main__":
+            function_ok = False
+            function_reason = (
+                "function object belongs to __main__ and is not portable across loading contexts"
+            )
+        else:
+            function_ok, function_reason = _try_serialize(
+                self.func,
+                serializer=self.serializer,
+            )
+
+        if function_ok:
+            blackbox_meta["function"] = self.func
+        else:
+            issue = _issue_record(
+                "output['__blackbox__']['function']",
+                self.func,
+                reason=function_reason or "function object is not serializable",
+                action="omitted function object",
+            )
+            _report_issue(
+                issue,
+                issues=function_issues,
+                on_serialize_error=self.on_serialize_error,
+            )
+
         data: dict = {
-            "result": _sanitize_for_pickle(result, serializer=self.serializer),
+            "result": result,
             "duration_ms": round(elapsed_ms, 3),
             "exception": None,
+            "__blackbox__": blackbox_meta,
         }
 
         exception_type = None
@@ -86,6 +143,7 @@ class CallArtifact:
             extra_meta={"elapsed_ms": round(elapsed_ms, 3)},
             exception_type=exception_type,
             locals_dict=locals_dict,
+            precomputed_issues=function_issues,
         )
 
     # ── internal ─────────────────────────────────────────────────────────────
@@ -98,12 +156,74 @@ class CallArtifact:
         extra_meta: dict | None = None,
         exception_type: str | None = None,
         locals_dict: dict | None = None,
+        precomputed_issues: list[dict[str, Any]] | None = None,
     ) -> None:
         pkl_path = self.call_dir / f"{name}.pkl"
         pkl_path.parent.mkdir(parents=True, exist_ok=True)
 
-        sanitized = _sanitize_for_pickle(data, serializer=self.serializer)
-        if _save_pickle(sanitized, str(pkl_path), serializer=self.serializer):
+        issues: list[dict[str, Any]] = list(precomputed_issues or [])
+        sanitized = _sanitize_for_pickle(
+            data,
+            serializer=self.serializer,
+            sanitize_hooks=self.sanitize_hooks,
+            on_serialize_error=self.on_serialize_error,
+            issues=issues,
+            path=name,
+        )
+        if name == "output" and isinstance(sanitized, dict):
+            blackbox_meta = sanitized.setdefault("__blackbox__", {})
+            if isinstance(blackbox_meta, dict):
+                blackbox_meta["serialization_issues"] = issues
+        saved = _save_pickle(sanitized, str(pkl_path), serializer=self.serializer)
+        if not saved and name == "output" and isinstance(sanitized, dict):
+            retried = dict(sanitized)
+            blackbox_meta = retried.get("__blackbox__", {})
+            if isinstance(blackbox_meta, dict) and "function" in blackbox_meta:
+                issue = _issue_record(
+                    "output['__blackbox__']['function']",
+                    self.func,
+                    reason="removed during final retry because the full output payload was still not serializable",
+                    action="removed function object and retried output.pkl save",
+                )
+                issues.append(issue)
+                blackbox_meta = dict(blackbox_meta)
+                blackbox_meta.pop("function", None)
+                blackbox_meta["serialization_issues"] = issues
+                retried["__blackbox__"] = blackbox_meta
+                saved = _save_pickle(retried, str(pkl_path), serializer=self.serializer)
+                if saved:
+                    sanitized = retried
+
+        if not saved and name == "output":
+            degraded_issue = {
+                "path": "output",
+                "type": type(sanitized).__name__,
+                "module": type(sanitized).__module__,
+                "reason": "output payload remained unserializable after final retry",
+                "action": "stored plain-data degraded output payload",
+            }
+            degraded = _to_plain_data(sanitized, path=name)
+            if not isinstance(degraded, dict):
+                degraded = {
+                    "result": _fallback_unserializable_marker(
+                        sanitized.get("result") if isinstance(sanitized, dict) else sanitized,
+                        "output payload remained unserializable after final retry",
+                    ),
+                    "duration_ms": sanitized.get("duration_ms") if isinstance(sanitized, dict) else None,
+                    "exception": sanitized.get("exception") if isinstance(sanitized, dict) else None,
+                    "locals": {},
+                    "__blackbox__": {
+                        "function_source": self.meta["function_source"],
+                    },
+                }
+
+            blackbox_meta = degraded.setdefault("__blackbox__", {})
+            if isinstance(blackbox_meta, dict):
+                blackbox_meta.setdefault("function_source", self.meta["function_source"])
+                blackbox_meta["serialization_issues"] = issues + [degraded_issue]
+            saved = _save_pickle(degraded, str(pkl_path), serializer=self.serializer)
+
+        if saved:
             self.saved.append(pkl_path)
 
         git_branch = _get_git_branch()
@@ -115,6 +235,9 @@ class CallArtifact:
             "created": self.meta["timestamp"],
             "role": name,
             "serializer": self.serializer,
+            "sourcePath": self.meta["source_path"],
+            "isAsync": self.meta["is_async"],
+            "title": self.call_dir.name,
             "exception": exception_type,
             "locals": sorted(locals_dict.keys()) if locals_dict else [],
         }
