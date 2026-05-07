@@ -1,4 +1,5 @@
 import hashlib
+import io
 import importlib
 import inspect
 import json
@@ -7,12 +8,15 @@ import re
 import subprocess
 import sys
 import warnings
+from contextlib import contextmanager
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 NOT_HANDLED = object()
 _MISSING_MAIN_ATTR_RE = re.compile(r"Can't get attribute '([^']+)' on <module '__main__'")
+_MISSING_FILE_RE = re.compile(r"\[Errno 2\] No such file or directory: '([^']+)'")
+_MP_CONNECTION_DEL_GUARD_INSTALLED = False
 
 
 def _get_serializer_module(serializer: str):
@@ -58,25 +62,280 @@ def _parse_missing_main_attribute(exc: Exception) -> str | None:
     return None
 
 
-def _load_dill_with_fallbacks(path: str) -> Any:
-    serializer_module = _get_serializer_module("dill")
+def _parse_missing_file_path(exc: Exception) -> str | None:
+    match = _MISSING_FILE_RE.search(str(exc))
+    if match:
+        return match.group(1)
+    return None
 
+
+def _parse_missing_module_name(exc: Exception) -> str | None:
+    if isinstance(exc, ModuleNotFoundError):
+        return getattr(exc, "name", None)
+    return None
+
+
+def _load_neighbor_meta(path: str) -> dict[str, Any] | None:
+    meta_path = Path(path).with_name("meta.json")
+    if not meta_path.exists():
+        return None
+    try:
+        with meta_path.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _snapshot_import_roots(path: str) -> list[str]:
+    meta = _load_neighbor_meta(path)
+    if not meta:
+        return []
+
+    roots: list[str] = []
+    seen: set[str] = set()
+
+    sys_path_entries = meta.get("sysPath")
+    if isinstance(sys_path_entries, list):
+        for entry in sys_path_entries:
+            if not isinstance(entry, str) or not entry:
+                continue
+            try:
+                value = str(Path(entry).resolve())
+            except Exception:
+                value = entry
+            if value not in seen:
+                roots.append(value)
+                seen.add(value)
+
+    cwd_value = meta.get("cwd")
+    if isinstance(cwd_value, str) and cwd_value:
+        try:
+            value = str(Path(cwd_value).resolve())
+        except Exception:
+            value = cwd_value
+        if value not in seen:
+            roots.insert(0, value)
+            seen.add(value)
+
+    source_path_raw = meta.get("sourcePath")
+    if not isinstance(source_path_raw, str) or not source_path_raw:
+        return roots
+
+    source_path = Path(source_path_raw).resolve()
+    module_name = meta.get("module")
+    candidates: list[Path] = []
+
+    if source_path.parent.exists():
+        candidates.append(source_path.parent)
+
+    current = source_path.parent
+    for _ in range(6):
+        if current.exists():
+            candidates.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+
+    if isinstance(module_name, str) and module_name:
+        parts = module_name.split(".")
+        current = source_path.parent
+        ascend = len(parts) if source_path.name == "__init__.py" else max(len(parts) - 1, 0)
+        for _ in range(ascend):
+            if current.parent == current:
+                break
+            current = current.parent
+        if current.exists():
+            candidates.insert(0, current)
+
+    for candidate in candidates:
+        value = str(candidate)
+        if value not in seen:
+            roots.append(value)
+            seen.add(value)
+    return roots
+
+
+@contextmanager
+def _temporary_sys_path(entries: list[str]):
+    added = [entry for entry in entries if entry and entry not in sys.path]
+    for entry in reversed(added):
+        sys.path.insert(0, entry)
+    try:
+        yield
+    finally:
+        for entry in added:
+            try:
+                sys.path.remove(entry)
+            except ValueError:
+                pass
+
+
+def _merge_import_roots(*groups: list[str] | tuple[str, ...] | None) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        if not group:
+            continue
+        for entry in group:
+            if not entry:
+                continue
+            try:
+                value = str(Path(entry).resolve())
+            except Exception:
+                value = str(entry)
+            if value not in seen:
+                merged.append(value)
+                seen.add(value)
+    return merged
+
+
+def _load_dill_file_with_options(
+    serializer_module,
+    path: str,
+    *,
+    ignore: bool | None = None,
+    allow_missing_filehandles: bool = False,
+) -> Any:
+    kwargs = {} if ignore is None else {"ignore": ignore}
+    if not allow_missing_filehandles:
+        with Path(path).open("rb") as f:
+            return serializer_module.load(f, **kwargs)  # noqa: S301
+
+    dill_impl = getattr(serializer_module, "_dill", None)
+    if dill_impl is None or not hasattr(dill_impl, "_create_filehandle"):
+        with Path(path).open("rb") as f:
+            return serializer_module.load(f, **kwargs)  # noqa: S301
+
+    original_create_filehandle = dill_impl._create_filehandle
+
+    def _patched_create_filehandle(
+        name,
+        mode,
+        position,
+        closed,
+        open,
+        strictio,
+        fmode,
+        fdata,
+    ):
+        try:
+            return original_create_filehandle(
+                name,
+                mode,
+                position,
+                closed,
+                open,
+                strictio,
+                fmode,
+                fdata,
+            )
+        except pickle.UnpicklingError as exc:
+            if _parse_missing_file_path(exc) is None:
+                raise
+
+            if "b" in mode:
+                handle = io.BytesIO(fdata if isinstance(fdata, (bytes, bytearray)) else b"")
+            else:
+                text = fdata if isinstance(fdata, str) else ""
+                handle = io.StringIO(text)
+
+            try:
+                handle.name = name
+            except Exception:
+                pass
+
+            if position:
+                handle.seek(position)
+            if closed:
+                handle.close()
+            return handle
+
+    dill_impl._create_filehandle = _patched_create_filehandle
     try:
         with Path(path).open("rb") as f:
-            return serializer_module.load(f)  # noqa: S301
+            return serializer_module.load(f, **kwargs)  # noqa: S301
+    finally:
+        dill_impl._create_filehandle = original_create_filehandle
+
+
+def _install_safe_multiprocessing_connection_guard() -> None:
+    global _MP_CONNECTION_DEL_GUARD_INSTALLED
+    if _MP_CONNECTION_DEL_GUARD_INSTALLED:
+        return
+
+    try:
+        import multiprocessing.connection as mp_connection
+    except ImportError:
+        return
+
+    if not hasattr(mp_connection, "_ConnectionBase"):
+        return
+
+    original_connection_del = mp_connection._ConnectionBase.__del__
+
+    def _patched_connection_del(self):
+        try:
+            original_connection_del(self)
+        except OSError as exc:
+            if exc.errno != 9:
+                raise
+
+    mp_connection._ConnectionBase.__del__ = _patched_connection_del
+    _MP_CONNECTION_DEL_GUARD_INSTALLED = True
+
+
+def _load_dill_with_fallbacks(path: str, *, import_roots: list[str] | None = None) -> Any:
+    serializer_module = _get_serializer_module("dill")
+    import_roots = _merge_import_roots(import_roots, _snapshot_import_roots(path))
+
+    try:
+        with _temporary_sys_path(import_roots):
+            return _load_dill_file_with_options(serializer_module, path)
     except AttributeError as exc:
         missing_name = _parse_missing_main_attribute(exc)
         if missing_name is None:
+            if _parse_missing_file_path(exc) is None:
+                raise
+    except pickle.UnpicklingError as exc:
+        if _parse_missing_file_path(exc) is None:
+            raise
+    except ModuleNotFoundError as exc:
+        if _parse_missing_module_name(exc) is None:
             raise
 
     try:
-        with Path(path).open("rb") as f:
-            return serializer_module.load(f, ignore=True)  # noqa: S301
+        with _temporary_sys_path(import_roots):
+            return _load_dill_file_with_options(
+                serializer_module,
+                path,
+                ignore=True,
+                allow_missing_filehandles=True,
+            )
     except TypeError:
-        pass
+        try:
+            with _temporary_sys_path(import_roots):
+                return _load_dill_file_with_options(
+                    serializer_module,
+                    path,
+                    allow_missing_filehandles=True,
+                )
+        except pickle.UnpicklingError as exc:
+            if _parse_missing_file_path(exc) is None:
+                raise
+        except ModuleNotFoundError as exc:
+            if _parse_missing_module_name(exc) is None:
+                raise
     except AttributeError as exc:
         missing_name = _parse_missing_main_attribute(exc)
         if missing_name is None:
+            if _parse_missing_file_path(exc) is None:
+                raise
+    except pickle.UnpicklingError as exc:
+        if _parse_missing_file_path(exc) is None:
+            raise
+    except ModuleNotFoundError as exc:
+        if _parse_missing_module_name(exc) is None:
             raise
 
     main_module = sys.modules.get("__main__")
@@ -87,17 +346,33 @@ def _load_dill_with_fallbacks(path: str) -> Any:
     last_exc: Exception | None = None
     while True:
         try:
-            with Path(path).open("rb") as f:
-                return serializer_module.load(f, ignore=True)  # noqa: S301
+            with _temporary_sys_path(import_roots):
+                return _load_dill_file_with_options(
+                    serializer_module,
+                    path,
+                    ignore=True,
+                    allow_missing_filehandles=True,
+                )
         except TypeError:
             try:
-                with Path(path).open("rb") as f:
-                    return serializer_module.load(f)  # noqa: S301
+                with _temporary_sys_path(import_roots):
+                    return _load_dill_file_with_options(
+                        serializer_module,
+                        path,
+                        allow_missing_filehandles=True,
+                    )
             except AttributeError as exc:
                 last_exc = exc
                 missing_name = _parse_missing_main_attribute(exc)
                 if missing_name is None:
                     raise
+            except pickle.UnpicklingError:
+                raise
+            except ModuleNotFoundError as exc:
+                missing_name = _parse_missing_module_name(exc)
+                if missing_name is None:
+                    raise
+                last_exc = exc
             except Exception:
                 raise
         except AttributeError as exc:
@@ -105,6 +380,14 @@ def _load_dill_with_fallbacks(path: str) -> Any:
             missing_name = _parse_missing_main_attribute(exc)
             if missing_name is None:
                 raise
+        except ModuleNotFoundError as exc:
+            missing_name = _parse_missing_module_name(exc)
+            if missing_name is None:
+                raise
+            last_exc = exc
+
+        if isinstance(last_exc, ModuleNotFoundError):
+            raise last_exc
 
         if hasattr(main_module, missing_name):
             if last_exc is not None:
@@ -117,6 +400,59 @@ def _load_dill_with_fallbacks(path: str) -> Any:
             if last_exc is not None:
                 raise last_exc
             raise RuntimeError("Exceeded dill fallback placeholder limit while loading snapshot.")
+
+
+def _neutralize_runtime_bound_objects(
+    obj: Any,
+    _seen: set[int] | None = None,
+) -> Any:
+    if _seen is None:
+        _seen = set()
+
+    if obj is None or isinstance(obj, (bool, int, float, str, bytes)):
+        return obj
+
+    obj_id = id(obj)
+    if obj_id in _seen:
+        return obj
+    _seen.add(obj_id)
+
+    try:
+        try:
+            import multiprocessing.connection as mp_connection
+        except ImportError:
+            mp_connection = None
+
+        if mp_connection is not None and isinstance(obj, mp_connection._ConnectionBase):
+            try:
+                obj._handle = None
+            except Exception:
+                pass
+            try:
+                obj._close = lambda *args, **kwargs: None
+            except Exception:
+                pass
+            return obj
+
+        if isinstance(obj, Mapping):
+            for key, value in list(obj.items()):
+                _neutralize_runtime_bound_objects(key, _seen)
+                _neutralize_runtime_bound_objects(value, _seen)
+            return obj
+
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            for item in obj:
+                _neutralize_runtime_bound_objects(item, _seen)
+            return obj
+
+        if hasattr(obj, "__dict__") and isinstance(getattr(obj, "__dict__", None), dict):
+            for value in obj.__dict__.values():
+                _neutralize_runtime_bound_objects(value, _seen)
+            return obj
+
+        return obj
+    finally:
+        _seen.discard(obj_id)
 
 
 def _try_serialize(obj: Any, *, serializer: str = "dill") -> tuple[bool, str | None]:
@@ -611,16 +947,24 @@ def _save_meta_json(data: dict[str, Any], path: str) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
 
 
-def load_pickle(path: str, *, serializer: str = "auto") -> Any:
+def load_pickle(
+    path: str,
+    *,
+    serializer: str = "auto",
+    import_roots: Sequence[str] | None = None,
+) -> Any:
     """Загружает бинарный артефакт через выбранный backend."""
     if serializer == "auto":
         try:
-            return load_pickle(path, serializer="dill")
+            return load_pickle(path, serializer="dill", import_roots=import_roots)
         except (pickle.UnpicklingError, EOFError, AttributeError, ImportError, ModuleNotFoundError, ValueError, TypeError):
-            return load_pickle(path, serializer="pickle")
+            return load_pickle(path, serializer="pickle", import_roots=import_roots)
 
     if serializer == "dill":
-        return _load_dill_with_fallbacks(path)
+        _install_safe_multiprocessing_connection_guard()
+        return _neutralize_runtime_bound_objects(
+            _load_dill_with_fallbacks(path, import_roots=list(import_roots or []))
+        )
 
     serializer_module = _get_serializer_module(serializer)
     with Path(path).open("rb") as f:

@@ -5,6 +5,7 @@
 """
 
 import inspect
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -64,8 +65,26 @@ class CallArtifact:
             "source_path": str(source_path),
             "is_async": inspect.iscoroutinefunction(func),
             "function_source": function_source,
+            "cwd": str(Path.cwd()),
+            "sys_path": self._capture_sys_path(),
         }
         self.saved: list[Path] = []
+
+    @staticmethod
+    def _capture_sys_path() -> list[str]:
+        entries: list[str] = []
+        seen: set[str] = set()
+        for raw in sys.path:
+            if not raw:
+                raw = str(Path.cwd())
+            try:
+                value = str(Path(raw).resolve())
+            except Exception:
+                continue
+            if value not in seen:
+                entries.append(value)
+                seen.add(value)
+        return entries
 
     # ── input ────────────────────────────────────────────────────────────────
 
@@ -236,6 +255,8 @@ class CallArtifact:
             "role": name,
             "serializer": self.serializer,
             "sourcePath": self.meta["source_path"],
+            "cwd": self.meta["cwd"],
+            "sysPath": self.meta["sys_path"],
             "isAsync": self.meta["is_async"],
             "title": self.call_dir.name,
             "exception": exception_type,
