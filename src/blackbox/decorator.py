@@ -5,11 +5,13 @@
 
 import functools
 import inspect
+import sys
 from collections.abc import Callable
 from datetime import datetime
 
 from .locals_capture import ASYNC_STRATEGIES, DEFAULT_STRATEGY, STRATEGIES
 from .persistence import CallArtifact
+from .session import begin_call, finish_call
 
 
 def _unwrap_descriptor(func: Callable) -> tuple[Callable, type | None]:
@@ -45,6 +47,86 @@ def blackbox(
 
             @functools.wraps(target_func)
             async def async_wrapper(*args, **kwargs):
+                call_context = begin_call(
+                    target_func,
+                    args,
+                    kwargs,
+                    save_dir,
+                    serializer=serializer,
+                )
+                elapsed_ms = None
+                exc_info = None
+                locals_dict = None
+                try:
+                    artifact = CallArtifact(
+                        target_func,
+                        args,
+                        kwargs,
+                        save_dir,
+                        serializer=serializer,
+                        sanitize_hooks=sanitize_hooks,
+                        on_serialize_error=on_serialize_error,
+                        call_context=call_context,
+                    )
+
+                    if save_input:
+                        artifact.save_input(args, kwargs)
+
+                    t_start = datetime.now()
+
+                    if capture_locals:
+                        strategy = ASYNC_STRATEGIES[locals_strategy]
+                        result, locals_dict, exc_info = await strategy(
+                            target_func, args, kwargs
+                        )
+                    else:
+                        try:
+                            result = await target_func(*args, **kwargs)
+                        except Exception as e:
+                            exc_info = e
+                            result = None
+
+                    elapsed_ms = (datetime.now() - t_start).total_seconds() * 1000
+
+                    if save_output:
+                        artifact.save_output(
+                            result,
+                            elapsed_ms,
+                            locals_dict=locals_dict,
+                            exc_info=exc_info,
+                        )
+
+                    if verbose:
+                        _print_summary(target_func.__name__, artifact.saved)
+
+                    if exc_info is not None:
+                        raise exc_info
+
+                    return result
+                finally:
+                    active_exc = sys.exc_info()[1]
+                    finish_call(
+                        call_context,
+                        elapsed_ms=elapsed_ms,
+                        exc_info=exc_info or active_exc,
+                        locals_dict=locals_dict,
+                    )
+
+            return _rewrap_descriptor(async_wrapper, descriptor_type)
+
+        @functools.wraps(target_func)
+        def wrapper(*args, **kwargs):
+            call_context = begin_call(
+                target_func,
+                args,
+                kwargs,
+                save_dir,
+                serializer=serializer,
+            )
+            elapsed_ms = None
+            exc_info = None
+            locals_dict = None
+            try:
                 artifact = CallArtifact(
                     target_func,
                     args,
@@ -53,28 +135,27 @@ def blackbox(
                     serializer=serializer,
                     sanitize_hooks=sanitize_hooks,
                     on_serialize_error=on_serialize_error,
+                    call_context=call_context,
                 )
 
                 if save_input:
                     artifact.save_input(args, kwargs)
 
+                # ── вызов функции ────────────────────────────────────────────────
                 t_start = datetime.now()
 
                 if capture_locals:
-                    strategy = ASYNC_STRATEGIES[locals_strategy]
-                    result, locals_dict, exc_info = await strategy(
-                        target_func, args, kwargs
-                    )
+                    strategy = STRATEGIES[locals_strategy]
+                    result, locals_dict, exc_info = strategy(target_func, args, kwargs)
                 else:
-                    exc_info = None
                     try:
-                        result = await target_func(*args, **kwargs)
+                        result = target_func(*args, **kwargs)
                     except Exception as e:
                         exc_info = e
                         result = None
-                    locals_dict = None
 
                 elapsed_ms = (datetime.now() - t_start).total_seconds() * 1000
+                # ────────────────────────────────────────────────────────────────
 
                 if save_output:
                     artifact.save_output(
@@ -91,57 +172,14 @@ def blackbox(
                     raise exc_info
 
                 return result
-
-            return _rewrap_descriptor(async_wrapper, descriptor_type)
-
-        @functools.wraps(target_func)
-        def wrapper(*args, **kwargs):
-            artifact = CallArtifact(
-                target_func,
-                args,
-                kwargs,
-                save_dir,
-                serializer=serializer,
-                sanitize_hooks=sanitize_hooks,
-                on_serialize_error=on_serialize_error,
-            )
-
-            if save_input:
-                artifact.save_input(args, kwargs)
-
-            # ── вызов функции ────────────────────────────────────────────────
-            t_start = datetime.now()
-
-            if capture_locals:
-                strategy = STRATEGIES[locals_strategy]
-                result, locals_dict, exc_info = strategy(target_func, args, kwargs)
-            else:
-                exc_info = None
-                try:
-                    result = target_func(*args, **kwargs)
-                except Exception as e:
-                    exc_info = e
-                    result = None
-                locals_dict = None
-
-            elapsed_ms = (datetime.now() - t_start).total_seconds() * 1000
-            # ────────────────────────────────────────────────────────────────
-
-            if save_output:
-                artifact.save_output(
-                    result,
-                    elapsed_ms,
+            finally:
+                active_exc = sys.exc_info()[1]
+                finish_call(
+                    call_context,
+                    elapsed_ms=elapsed_ms,
+                    exc_info=exc_info or active_exc,
                     locals_dict=locals_dict,
-                    exc_info=exc_info,
                 )
-
-            if verbose:
-                _print_summary(target_func.__name__, artifact.saved)
-
-            if exc_info is not None:
-                raise exc_info
-
-            return result
 
         return _rewrap_descriptor(wrapper, descriptor_type)
 

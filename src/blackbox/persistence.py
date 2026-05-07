@@ -22,6 +22,7 @@ from .io import (
     _to_plain_data,
     _try_serialize,
 )
+from .session import CallContext
 
 
 class CallArtifact:
@@ -40,14 +41,28 @@ class CallArtifact:
         serializer: str = "dill",
         sanitize_hooks: list | None = None,
         on_serialize_error: str = "warn",
+        call_context: CallContext | None = None,
     ):
         base_dir = Path(save_dir)
         source_path = Path(func.__code__.co_filename).resolve()
         source_file = source_path.name
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        call_hash = _make_hash(args, kwargs, serializer=serializer)
+        timestamp = (
+            call_context.timestamp
+            if call_context is not None
+            else datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        )
+        call_hash = (
+            call_context.call_hash
+            if call_context is not None
+            else _make_hash(args, kwargs, serializer=serializer)
+        )
 
-        self.call_dir = base_dir / source_file / func.__name__ / f"{timestamp}_{call_hash}"
+        self.call_context = call_context
+        self.call_dir = (
+            call_context.artifact_dir
+            if call_context is not None
+            else base_dir / source_file / func.__name__ / f"{timestamp}_{call_hash}"
+        )
         self.serializer = serializer
         self.sanitize_hooks = sanitize_hooks or []
         self.on_serialize_error = on_serialize_error
@@ -68,6 +83,19 @@ class CallArtifact:
             "cwd": str(Path.cwd()),
             "sys_path": self._capture_sys_path(),
         }
+        if call_context is not None:
+            self.meta.update(
+                {
+                    "session_id": call_context.session_id,
+                    "call_id": call_context.call_id,
+                    "sequence": call_context.sequence,
+                    "parent_call_id": call_context.parent_call_id,
+                    "depth": call_context.depth,
+                    "artifact_dir": call_context.artifact_dir_rel,
+                    "pid": call_context.pid,
+                    "thread_id": call_context.thread_id,
+                }
+            )
         self.saved: list[Path] = []
 
     @staticmethod
@@ -262,6 +290,19 @@ class CallArtifact:
             "exception": exception_type,
             "locals": sorted(locals_dict.keys()) if locals_dict else [],
         }
+        if self.call_context is not None:
+            meta_data.update(
+                {
+                    "sessionId": self.meta["session_id"],
+                    "callId": self.meta["call_id"],
+                    "sequence": self.meta["sequence"],
+                    "parentCallId": self.meta["parent_call_id"],
+                    "depth": self.meta["depth"],
+                    "artifactDir": self.meta["artifact_dir"],
+                    "pid": self.meta["pid"],
+                    "threadId": self.meta["thread_id"],
+                }
+            )
         if extra_meta and extra_meta.get("elapsed_ms"):
             meta_data["elapsedMs"] = extra_meta["elapsed_ms"]
 
