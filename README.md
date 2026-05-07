@@ -236,17 +236,38 @@ raw = load_pickle("/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34/
 raw = load_pickle("/tmp/blackbox/example.py/build_fn/20260425_120102_123456_ab12cd34/output.pkl", serializer="dill")
 ```
 
+Если снапшот был записан в другом runtime-контексте, например внутри контейнера
+или воркера с другим `sys.path`, можно явно передать import roots:
+
+```python
+raw = load_pickle(
+    "/tmp/blackbox/example.py/build_fn/20260425_120102_123456_ab12cd34/output.pkl",
+    serializer="dill",
+    import_roots=["/Users/roman/dev/my-project"],
+)
+```
+
 Для более удобной инспекции есть helper-функции в `blackbox.helpers`:
 
 ```python
 from blackbox.helpers import get_args, get_local_vars, get_result, read_var_from_pickle
 
-args_info = get_args("/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34/input.pkl")
-locals_info = get_local_vars("/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34/output.pkl")
-result_info = get_result("/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34/output.pkl")
+args_info = get_args(
+    "/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34/input.pkl",
+    import_roots=["/Users/roman/dev/my-project"],
+)
+locals_info = get_local_vars(
+    "/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34/output.pkl",
+    import_roots=["/Users/roman/dev/my-project"],
+)
+result_info = get_result(
+    "/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34/output.pkl",
+    import_roots=["/Users/roman/dev/my-project"],
+)
 value_json = read_var_from_pickle(
     "/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34/output.pkl",
     "total",
+    import_roots=["/Users/roman/dev/my-project"],
 )
 ```
 
@@ -258,15 +279,16 @@ value_json = read_var_from_pickle(
 - `read_var_from_pickle(...)` — чтение конкретной локальной переменной из `output.pkl`
 - `create_snapshot_notebook(...)` — генерация Jupyter notebook для исследования снапшота
 - `open_result_in_repl(...)` и `open_var_in_repl(...)` — быстрый экспорт значения в интерактивную сессию
+- `import_roots=[...]` — явные корни импорта для снапшотов из другого runtime-контекста
 
 Helper-скрипты также можно запускать напрямую:
 
 ```bash
-python -m blackbox.helpers.get_result --pickle-path /tmp/blackbox/example.py/add/.../output.pkl
-python -m blackbox.helpers.get_local_vars --pickle-path /tmp/blackbox/example.py/add/.../output.pkl
-python -m blackbox.helpers.read_var_from_pickle --pickle-path /tmp/blackbox/example.py/add/.../output.pkl --var-name total
-python -m blackbox.helpers.create_snapshot_notebook --snapshot-path /tmp/blackbox/example.py/add/.../
-python -m blackbox.helpers.create_snapshot_notebook --snapshot-path /tmp/blackbox/example.py/add/.../ --compare-with /tmp/blackbox/example.py/add-other/.../
+python -m blackbox.helpers.get_result --pickle-path /tmp/blackbox/example.py/add/.../output.pkl --import-root /Users/roman/dev/my-project
+python -m blackbox.helpers.get_local_vars --pickle-path /tmp/blackbox/example.py/add/.../output.pkl --import-root /Users/roman/dev/my-project
+python -m blackbox.helpers.read_var_from_pickle --pickle-path /tmp/blackbox/example.py/add/.../output.pkl --var-name total --import-root /Users/roman/dev/my-project
+python -m blackbox.helpers.create_snapshot_notebook --snapshot-path /tmp/blackbox/example.py/add/.../ --import-root /Users/roman/dev/my-project
+python -m blackbox.helpers.create_snapshot_notebook --snapshot-path /tmp/blackbox/example.py/add/.../ --compare-with /tmp/blackbox/example.py/add-other/.../ --import-root /Users/roman/dev/my-project
 ```
 
 Notebook generation:
@@ -275,7 +297,8 @@ Notebook generation:
 from blackbox.helpers import create_snapshot_notebook
 
 notebook_path = create_snapshot_notebook(
-    "/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34"
+    "/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34",
+    import_roots=["/Users/roman/dev/my-project"],
 )
 print(notebook_path)
 ```
@@ -288,6 +311,7 @@ from blackbox.helpers import create_snapshot_notebook
 notebook_path = create_snapshot_notebook(
     "/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34",
     compare_with="/tmp/blackbox/example.py/add/20260425_120301_654321_ef56ab78",
+    import_roots=["/Users/roman/dev/my-project"],
 )
 print(notebook_path)
 ```

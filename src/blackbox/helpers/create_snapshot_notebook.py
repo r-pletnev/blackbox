@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .common import install_import_guards, load_pickle
+    from .common import install_import_guards, load_pickle, parse_import_roots
 except ImportError:
-    from common import install_import_guards, load_pickle
+    from common import install_import_guards, load_pickle, parse_import_roots
 
 
 def _read_json(path: Path) -> dict:
@@ -119,13 +119,23 @@ def _has_output(bundle: dict) -> bool:
     return bundle["output_path"] is not None and isinstance(bundle["output_data"], dict)
 
 
-def _load_snapshot_bundle(path: str) -> dict:
+def _load_snapshot_bundle(path: str, import_roots: list[str] | None = None) -> dict:
     snapshot_dir, input_path, output_path, meta_path = _ensure_snapshot_paths(path)
     meta = _read_json(meta_path)
     serializer = meta.get("serializer", "auto")
-    input_data = load_pickle(str(input_path), serializer=serializer)
+    input_data = load_pickle(
+        str(input_path),
+        serializer=serializer,
+        import_roots=import_roots,
+    )
     output_data = (
-        load_pickle(str(output_path), serializer=serializer) if output_path else {}
+        load_pickle(
+            str(output_path),
+            serializer=serializer,
+            import_roots=import_roots,
+        )
+        if output_path
+        else {}
     )
     return {
         "snapshot_dir": snapshot_dir,
@@ -134,6 +144,7 @@ def _load_snapshot_bundle(path: str) -> dict:
         "meta_path": meta_path,
         "meta": meta,
         "serializer": serializer,
+        "import_roots": import_roots or [],
         "input_data": input_data,
         "output_data": output_data,
         "has_output": output_path is not None,
@@ -260,8 +271,9 @@ def _build_source_code_block(bundle: dict) -> str:
 
 
 def _build_bootstrap_code_single(bundle: dict) -> str:
+    import_roots_line = f"import_roots = {bundle['import_roots']!r}"
     output_line = (
-        f"output_data = load_pickle({str(bundle['output_path'])!r}, serializer={bundle['serializer']!r})"
+        f"output_data = load_pickle({str(bundle['output_path'])!r}, serializer={bundle['serializer']!r}, import_roots=import_roots)"
         if bundle["output_path"] is not None
         else "output_data = {}"
     )
@@ -270,7 +282,8 @@ def _build_bootstrap_code_single(bundle: dict) -> str:
             "from pprint import pprint",
             "from blackbox.io import load_pickle",
             "",
-            f"input_data = load_pickle({str(bundle['input_path'])!r}, serializer={bundle['serializer']!r})",
+            import_roots_line,
+            f"input_data = load_pickle({str(bundle['input_path'])!r}, serializer={bundle['serializer']!r}, import_roots=import_roots)",
             output_line,
             "args = input_data.get('args', ())",
             "kwargs = input_data.get('kwargs', {})",
@@ -378,13 +391,14 @@ def _build_compare_source_code_block(bundle_a: dict, bundle_b: dict) -> str:
 
 
 def _build_bootstrap_code_compare(bundle_a: dict, bundle_b: dict) -> str:
+    import_roots_line = f"import_roots = {bundle_a['import_roots']!r}"
     output_a_line = (
-        f"output_data_a = load_pickle({str(bundle_a['output_path'])!r}, serializer={bundle_a['serializer']!r})"
+        f"output_data_a = load_pickle({str(bundle_a['output_path'])!r}, serializer={bundle_a['serializer']!r}, import_roots=import_roots)"
         if bundle_a["output_path"] is not None
         else "output_data_a = {}"
     )
     output_b_line = (
-        f"output_data_b = load_pickle({str(bundle_b['output_path'])!r}, serializer={bundle_b['serializer']!r})"
+        f"output_data_b = load_pickle({str(bundle_b['output_path'])!r}, serializer={bundle_b['serializer']!r}, import_roots=import_roots)"
         if bundle_b["output_path"] is not None
         else "output_data_b = {}"
     )
@@ -394,6 +408,8 @@ def _build_bootstrap_code_compare(bundle_a: dict, bundle_b: dict) -> str:
             "from pprint import pprint",
             "from IPython.display import HTML, display",
             "from blackbox.io import load_pickle",
+            "",
+            import_roots_line,
             "",
             "def show_html_diff(",
             "    old: str,",
@@ -515,9 +531,9 @@ def _build_bootstrap_code_compare(bundle_a: dict, bundle_b: dict) -> str:
             "",
             "    display(HTML(style + f'<div class=\"diff-wrapper\">{html_table}</div>'))",
             "",
-            f"input_data_a = load_pickle({str(bundle_a['input_path'])!r}, serializer={bundle_a['serializer']!r})",
+            f"input_data_a = load_pickle({str(bundle_a['input_path'])!r}, serializer={bundle_a['serializer']!r}, import_roots=import_roots)",
             output_a_line,
-            f"input_data_b = load_pickle({str(bundle_b['input_path'])!r}, serializer={bundle_b['serializer']!r})",
+            f"input_data_b = load_pickle({str(bundle_b['input_path'])!r}, serializer={bundle_b['serializer']!r}, import_roots=import_roots)",
             output_b_line,
             "",
             "args_a = input_data_a.get('args', ())",
@@ -738,11 +754,14 @@ def create_snapshot_notebook(
     snapshot_path: str,
     compare_with: str | None = None,
     output_path: str | None = None,
+    import_roots: list[str] | None = None,
 ) -> str:
     install_import_guards()
 
-    bundle = _load_snapshot_bundle(snapshot_path)
-    compare_bundle = _load_snapshot_bundle(compare_with) if compare_with else None
+    bundle = _load_snapshot_bundle(snapshot_path, import_roots=import_roots)
+    compare_bundle = (
+        _load_snapshot_bundle(compare_with, import_roots=import_roots) if compare_with else None
+    )
 
     if compare_bundle is None:
         notebook_path = (
@@ -787,12 +806,14 @@ def main() -> None:
     parser.add_argument("--snapshot-path", required=True)
     parser.add_argument("--compare-with")
     parser.add_argument("--output-path")
+    parser.add_argument("--import-root", action="append", dest="import_roots")
     args = parser.parse_args()
     print(
         create_snapshot_notebook(
             args.snapshot_path,
             compare_with=args.compare_with,
             output_path=args.output_path,
+            import_roots=parse_import_roots(args.import_roots),
         )
     )
 

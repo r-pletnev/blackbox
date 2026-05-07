@@ -21,6 +21,10 @@ def install_import_guards() -> None:
         sys.modules.setdefault(module_name, MagicMock())
 
 
+def parse_import_roots(values: list[str] | None) -> list[str]:
+    return [value for value in values or [] if value]
+
+
 def get_locals_data(data):
     locals_data = data.get("locals", {}) if isinstance(data, dict) else {}
     if not locals_data and isinstance(data, dict) and "result" in data:

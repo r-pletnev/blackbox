@@ -1,14 +1,18 @@
 import argparse
 
 try:
-    from .common import get_result_data, install_import_guards, load_pickle
+    from .common import get_result_data, install_import_guards, load_pickle, parse_import_roots
 except ImportError:
-    from common import get_result_data, install_import_guards, load_pickle
+    from common import get_result_data, install_import_guards, load_pickle, parse_import_roots
 
 
-def open_result_in_repl(pickle_path: str, result_key: str | None = None) -> None:
+def open_result_in_repl(
+    pickle_path: str,
+    result_key: str | None = None,
+    import_roots: list[str] | None = None,
+) -> None:
     install_import_guards()
-    data = load_pickle(pickle_path)
+    data = load_pickle(pickle_path, import_roots=import_roots)
     result_data = get_result_data(data)
 
     if result_key:
@@ -34,8 +38,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pickle-path", required=True)
     parser.add_argument("--result-key")
+    parser.add_argument("--import-root", action="append", dest="import_roots")
     args = parser.parse_args()
-    open_result_in_repl(args.pickle_path, args.result_key)
+    open_result_in_repl(
+        args.pickle_path,
+        args.result_key,
+        import_roots=parse_import_roots(args.import_roots),
+    )
 
 
 if __name__ == "__main__":

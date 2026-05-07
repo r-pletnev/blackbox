@@ -3,14 +3,14 @@ import json
 import sys
 
 try:
-    from .common import dumps_json, install_import_guards, load_pickle
+    from .common import dumps_json, install_import_guards, load_pickle, parse_import_roots
 except ImportError:
-    from common import dumps_json, install_import_guards, load_pickle
+    from common import dumps_json, install_import_guards, load_pickle, parse_import_roots
 
 
-def get_args(input_path: str):
+def get_args(input_path: str, import_roots: list[str] | None = None):
     install_import_guards()
-    data = load_pickle(input_path)
+    data = load_pickle(input_path, import_roots=import_roots)
     args_data = data if isinstance(data, dict) else {}
     args_list = args_data.get("args", [])
     kwargs_data = args_data.get("kwargs", {})
@@ -40,8 +40,14 @@ def get_args(input_path: str):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-path", required=True)
+    parser.add_argument("--import-root", action="append", dest="import_roots")
     args = parser.parse_args()
-    print(json.dumps(get_args(args.input_path), ensure_ascii=False))
+    print(
+        json.dumps(
+            get_args(args.input_path, import_roots=parse_import_roots(args.import_roots)),
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
