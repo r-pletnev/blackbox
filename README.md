@@ -111,6 +111,8 @@ blackbox(
     sanitize_hooks=None,
     on_serialize_error="warn",
     locals_strategy="settrace",
+    max_depth=1,
+    project_roots=None,
 )
 ```
 
@@ -125,6 +127,39 @@ blackbox(
 - `sanitize_hooks` — пользовательские функции санации для нестандартных типов
 - `on_serialize_error` — поведение при проблемах сериализации: `"warn"`, `"silent"` или `"raise"`
 - `locals_strategy` — стратегия захвата локальных переменных
+- `max_depth` — глубина захвата пользовательских вложенных вызовов;
+  `1` сохраняет только явно декорированную функцию
+- `project_roots` — явные корни пользовательского кода для `max_depth > 1`
+
+## Вложенные вызовы
+
+Для sync-функций `max_depth > 1` включает захват недекорированных пользовательских
+вызовов внутри декорированной функции:
+
+```python
+from blackbox import blackbox
+
+
+def normalize(value: int) -> int:
+    return value + 1
+
+
+@blackbox(max_depth=2)
+def process(value: int) -> int:
+    return normalize(value) * 2
+```
+
+В session `meta.json` появятся оба вызова: `process` с `depth=0` и `normalize`
+с `depth=1`. Вложенные артефакты сохраняются в том же формате:
+`input.pkl`, `output.pkl`, `meta.json`.
+
+Ограничения v1:
+
+- nested capture работает только для sync-функций
+- async-функции с `max_depth > 1` пишут `RuntimeWarning` и выполняются как
+  `max_depth=1`
+- новые треды и процессы группируются в session, но не получают автоматический
+  nested tracing из родительского вызова
 
 ## Стратегии захвата locals
 

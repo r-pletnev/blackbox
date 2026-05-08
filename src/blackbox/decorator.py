@@ -6,10 +6,12 @@
 import functools
 import inspect
 import sys
+import warnings
 from collections.abc import Callable
 from datetime import datetime
 
 from .locals_capture import ASYNC_STRATEGIES, DEFAULT_STRATEGY, STRATEGIES
+from .nested_capture import capture_nested_sync, register_decorated_code
 from .persistence import CallArtifact
 from .session import begin_call, finish_call
 
@@ -39,14 +41,28 @@ def blackbox(
     sanitize_hooks: list | None = None,
     on_serialize_error: str = "warn",
     locals_strategy: str = DEFAULT_STRATEGY,  # ← переключатель стратегий
+    max_depth: int = 1,
+    project_roots: list[str] | None = None,
 ):
+    if max_depth < 1:
+        raise ValueError("max_depth must be greater than or equal to 1")
+
     def decorator(func: Callable) -> Callable:
         target_func, descriptor_type = _unwrap_descriptor(func)
+        register_decorated_code(target_func.__code__)
 
         if inspect.iscoroutinefunction(target_func):
 
             @functools.wraps(target_func)
             async def async_wrapper(*args, **kwargs):
+                if max_depth > 1:
+                    warnings.warn(
+                        "blackbox max_depth > 1 is not supported for async "
+                        "functions yet; falling back to max_depth=1",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
                 call_context = begin_call(
                     target_func,
                     args,
@@ -144,7 +160,24 @@ def blackbox(
                 # ── вызов функции ────────────────────────────────────────────────
                 t_start = datetime.now()
 
-                if capture_locals:
+                if max_depth > 1:
+                    result, locals_dict, exc_info = capture_nested_sync(
+                        target_func,
+                        args,
+                        kwargs,
+                        root_context=call_context,
+                        save_dir=save_dir,
+                        save_input=save_input,
+                        save_output=save_output,
+                        capture_locals=capture_locals,
+                        locals_strategy=locals_strategy,
+                        max_depth=max_depth,
+                        serializer=serializer,
+                        sanitize_hooks=sanitize_hooks,
+                        on_serialize_error=on_serialize_error,
+                        project_roots=project_roots,
+                    )
+                elif capture_locals:
                     strategy = STRATEGIES[locals_strategy]
                     result, locals_dict, exc_info = strategy(target_func, args, kwargs)
                 else:
