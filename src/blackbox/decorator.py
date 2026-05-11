@@ -13,7 +13,7 @@ from datetime import datetime
 from .locals_capture import ASYNC_STRATEGIES, DEFAULT_STRATEGY, STRATEGIES
 from .nested_capture import capture_nested_sync, register_decorated_code
 from .persistence import CallArtifact
-from .session import begin_call, finish_call
+from .session import begin_call, finish_call, measure_memory
 
 
 def _unwrap_descriptor(func: Callable) -> tuple[Callable, type | None]:
@@ -43,6 +43,7 @@ def blackbox(
     locals_strategy: str = DEFAULT_STRATEGY,  # ← переключатель стратегий
     max_depth: int = 1,
     project_roots: list[str] | None = None,
+    capture_memory: bool = True,
 ):
     if max_depth < 1:
         raise ValueError("max_depth must be greater than or equal to 1")
@@ -69,10 +70,12 @@ def blackbox(
                     kwargs,
                     save_dir,
                     serializer=serializer,
+                    capture_memory=capture_memory,
                 )
                 elapsed_ms = None
                 exc_info = None
                 locals_dict = None
+                memory = None
                 try:
                     artifact = CallArtifact(
                         target_func,
@@ -103,6 +106,7 @@ def blackbox(
                             result = None
 
                     elapsed_ms = (datetime.now() - t_start).total_seconds() * 1000
+                    memory = measure_memory(call_context)
 
                     if save_output:
                         artifact.save_output(
@@ -110,6 +114,7 @@ def blackbox(
                             elapsed_ms,
                             locals_dict=locals_dict,
                             exc_info=exc_info,
+                            memory=memory,
                         )
 
                     if verbose:
@@ -126,6 +131,7 @@ def blackbox(
                         elapsed_ms=elapsed_ms,
                         exc_info=exc_info or active_exc,
                         locals_dict=locals_dict,
+                        memory=memory,
                     )
 
             return _rewrap_descriptor(async_wrapper, descriptor_type)
@@ -138,10 +144,12 @@ def blackbox(
                 kwargs,
                 save_dir,
                 serializer=serializer,
+                capture_memory=capture_memory,
             )
             elapsed_ms = None
             exc_info = None
             locals_dict = None
+            memory = None
             try:
                 artifact = CallArtifact(
                     target_func,
@@ -176,6 +184,7 @@ def blackbox(
                         sanitize_hooks=sanitize_hooks,
                         on_serialize_error=on_serialize_error,
                         project_roots=project_roots,
+                        capture_memory=capture_memory,
                     )
                 elif capture_locals:
                     strategy = STRATEGIES[locals_strategy]
@@ -188,6 +197,7 @@ def blackbox(
                         result = None
 
                 elapsed_ms = (datetime.now() - t_start).total_seconds() * 1000
+                memory = measure_memory(call_context)
                 # ────────────────────────────────────────────────────────────────
 
                 if save_output:
@@ -196,6 +206,7 @@ def blackbox(
                         elapsed_ms,
                         locals_dict=locals_dict,
                         exc_info=exc_info,
+                        memory=memory,
                     )
 
                 if verbose:
@@ -212,6 +223,7 @@ def blackbox(
                     elapsed_ms=elapsed_ms,
                     exc_info=exc_info or active_exc,
                     locals_dict=locals_dict,
+                    memory=memory,
                 )
 
         return _rewrap_descriptor(wrapper, descriptor_type)

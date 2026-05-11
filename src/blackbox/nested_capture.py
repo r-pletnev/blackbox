@@ -10,7 +10,7 @@ from typing import Any
 
 from .locals_capture import DEFAULT_STRATEGY
 from .persistence import CallArtifact
-from .session import CallContext, begin_call, finish_call
+from .session import CallContext, begin_call, finish_call, measure_memory
 
 
 _BLACKBOX_ROOT = Path(__file__).resolve().parent
@@ -56,6 +56,7 @@ def capture_nested_sync(
     sanitize_hooks: list | None = None,
     on_serialize_error: str = "warn",
     project_roots: list[str] | None = None,
+    capture_memory: bool = False,
 ) -> tuple[Any, dict | None, Exception | None]:
     original_trace = sys.gettrace()
     roots = _project_roots(func, project_roots)
@@ -127,6 +128,7 @@ def capture_nested_sync(
                 call_kwargs,
                 save_dir,
                 serializer=serializer,
+                capture_memory=capture_memory,
             )
             artifact = CallArtifact(
                 frame_func,
@@ -179,6 +181,7 @@ def capture_nested_sync(
         elapsed_ms = (datetime.now() - entry.started_at).total_seconds() * 1000
         exc_info = entry.pending_exception
         result = None if exc_info is not None else return_value
+        memory = measure_memory(entry.context)
 
         if save_output:
             entry.artifact.save_output(
@@ -186,12 +189,14 @@ def capture_nested_sync(
                 elapsed_ms,
                 locals_dict=entry.locals if capture_locals else None,
                 exc_info=exc_info,
+                memory=memory,
             )
         finish_call(
             entry.context,
             elapsed_ms=elapsed_ms,
             exc_info=exc_info,
             locals_dict=entry.locals if capture_locals else None,
+            memory=memory,
         )
 
     sys.settrace(_trace)

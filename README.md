@@ -113,6 +113,7 @@ blackbox(
     locals_strategy="settrace",
     max_depth=1,
     project_roots=None,
+    capture_memory=False,
 )
 ```
 
@@ -130,6 +131,8 @@ blackbox(
 - `max_depth` — глубина захвата пользовательских вложенных вызовов;
   `1` сохраняет только явно декорированную функцию
 - `project_roots` — явные корни пользовательского кода для `max_depth > 1`
+- `capture_memory` — сохранять легкую memory-метрику в per-call `meta.json`
+  и session `meta.json`
 
 ## Вложенные вызовы
 
@@ -160,6 +163,41 @@ def process(value: int) -> int:
   `max_depth=1`
 - новые треды и процессы группируются в session, но не получают автоматический
   nested tracing из родительского вызова
+
+## Метрики памяти
+
+Если включить `capture_memory=True`, в per-call `meta.json` и в записи вызова
+в session `meta.json` появится поле `memory`:
+
+```python
+from blackbox import blackbox
+
+
+@blackbox(capture_memory=True)
+def build_items(count: int) -> list[str]:
+    return [str(index) for index in range(count)]
+```
+
+Пример формы данных:
+
+```json
+{
+  "backend": "tracemalloc+resource",
+  "pythonCurrentStartBytes": 1200,
+  "pythonCurrentEndBytes": 8400,
+  "pythonCurrentDeltaBytes": 7200,
+  "pythonPeakBytes": 11000,
+  "processMaxRssStartBytes": 32000000,
+  "processMaxRssEndBytes": 33000000,
+  "processMaxRssDeltaBytes": 1000000
+}
+```
+
+`python*` поля берутся из `tracemalloc` и отражают Python allocations.
+`processMaxRss*` берется из `resource.getrusage` и показывает high-water RSS
+процесса. Эти значения являются наблюдением за процессом во время вызова, а не
+математически изолированной памятью функции; при тредах, async и вложенных
+вызовах их нужно читать именно так.
 
 ## Стратегии захвата locals
 

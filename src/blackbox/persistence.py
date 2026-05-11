@@ -128,6 +128,7 @@ class CallArtifact:
         elapsed_ms: float,
         locals_dict: dict | None = None,
         exc_info: Exception | None = None,
+        memory: dict[str, Any] | None = None,
     ) -> None:
         blackbox_meta: dict[str, Any] = {
             "function_source": self.meta["function_source"],
@@ -187,7 +188,7 @@ class CallArtifact:
         self._persist(
             data,
             "output",
-            extra_meta={"elapsed_ms": round(elapsed_ms, 3)},
+            extra_meta={"elapsed_ms": round(elapsed_ms, 3), "memory": memory},
             exception_type=exception_type,
             locals_dict=locals_dict,
             precomputed_issues=function_issues,
@@ -305,6 +306,8 @@ class CallArtifact:
             )
         if extra_meta and extra_meta.get("elapsed_ms"):
             meta_data["elapsedMs"] = extra_meta["elapsed_ms"]
+        if extra_meta and extra_meta.get("memory") is not None:
+            meta_data["memory"] = extra_meta["memory"]
 
         meta_path = self.call_dir / "meta.json"
         _save_meta_json(meta_data, str(meta_path))

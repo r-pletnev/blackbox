@@ -13,6 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from .io import _get_git_branch, _make_hash
+from .memory import (
+    MemoryMeasurement,
+    begin_memory_measurement,
+    finish_memory_measurement,
+)
 
 try:
     import fcntl
@@ -47,6 +52,7 @@ class CallContext:
     pid: int
     thread_id: int
     token: contextvars.Token[tuple[str, ...]]
+    memory_measurement: MemoryMeasurement | None = None
 
 
 def begin_call(
@@ -56,6 +62,7 @@ def begin_call(
     save_dir: str,
     *,
     serializer: str = "dill",
+    capture_memory: bool = False,
 ) -> CallContext:
     session_id, session_dir = _get_or_create_session(save_dir)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -66,6 +73,7 @@ def begin_call(
     pid = os.getpid()
     thread_id = threading.get_ident()
     started_at = _now_iso()
+    memory_measurement = begin_memory_measurement() if capture_memory else None
 
     with _session_lock(session_dir):
         meta = _load_or_create_meta(session_id, session_dir)
@@ -73,28 +81,30 @@ def begin_call(
         call_id = f"c{sequence:06d}"
         artifact_dir_rel = _artifact_dir_rel(func, sequence, timestamp, call_hash)
         artifact_dir = session_dir / artifact_dir_rel
-        meta["calls"].append(
-            {
-                "id": call_id,
-                "sequence": sequence,
-                "parentCallId": parent_call_id,
-                "depth": depth,
-                "status": "running",
-                "function": getattr(func, "__name__", repr(func)),
-                "module": getattr(func, "__module__", None),
-                "sourcePath": str(Path(func.__code__.co_filename).resolve()),
-                "line": getattr(func.__code__, "co_firstlineno", None),
-                "isAsync": _is_async(func),
-                "pid": pid,
-                "threadId": thread_id,
-                "startedAt": started_at,
-                "endedAt": None,
-                "elapsedMs": None,
-                "exception": None,
-                "callHash": call_hash,
-                "artifactDir": artifact_dir_rel,
-            }
-        )
+        call_meta = {
+            "id": call_id,
+            "sequence": sequence,
+            "parentCallId": parent_call_id,
+            "depth": depth,
+            "status": "running",
+            "function": getattr(func, "__name__", repr(func)),
+            "module": getattr(func, "__module__", None),
+            "sourcePath": str(Path(func.__code__.co_filename).resolve()),
+            "line": getattr(func.__code__, "co_firstlineno", None),
+            "isAsync": _is_async(func),
+            "pid": pid,
+            "threadId": thread_id,
+            "startedAt": started_at,
+            "endedAt": None,
+            "elapsedMs": None,
+            "exception": None,
+            "callHash": call_hash,
+            "artifactDir": artifact_dir_rel,
+        }
+        memory_payload = _initial_memory_payload(memory_measurement)
+        if memory_payload is not None:
+            call_meta["memory"] = memory_payload
+        meta["calls"].append(call_meta)
         meta["updatedAt"] = started_at
         _save_json_atomic(meta, session_dir / "meta.json")
 
@@ -114,7 +124,14 @@ def begin_call(
         pid=pid,
         thread_id=thread_id,
         token=token,
+        memory_measurement=memory_measurement,
     )
+
+
+def measure_memory(context: CallContext) -> dict[str, int | str | None] | None:
+    if context.memory_measurement is None:
+        return None
+    return finish_memory_measurement(context.memory_measurement)
 
 
 def finish_call(
@@ -123,6 +140,7 @@ def finish_call(
     elapsed_ms: float | None = None,
     exc_info: BaseException | None = None,
     locals_dict: dict | None = None,
+    memory: dict[str, int | str | None] | None = None,
 ) -> None:
     ended_at = _now_iso()
     status = "failed" if exc_info is not None else "completed"
@@ -139,6 +157,10 @@ def finish_call(
                         round(elapsed_ms, 3) if elapsed_ms is not None else None
                     )
                     call["exception"] = exception_type
+                    if memory is None:
+                        memory = measure_memory(context)
+                    if memory is not None:
+                        call["memory"] = memory
                     if locals_dict:
                         call["locals"] = sorted(locals_dict)
                     break
@@ -196,6 +218,26 @@ def _next_sequence(session_dir: Path) -> int:
     value = current + 1
     counter_path.write_text(str(value), encoding="utf-8")
     return value
+
+
+def _initial_memory_payload(
+    measurement: MemoryMeasurement | None,
+) -> dict[str, int | str | None] | None:
+    if measurement is None:
+        return None
+    snapshot = measurement.start
+    return {
+        "backend": "tracemalloc+resource"
+        if snapshot.process_max_rss_bytes is not None
+        else "tracemalloc",
+        "pythonCurrentStartBytes": snapshot.python_current_bytes,
+        "pythonCurrentEndBytes": None,
+        "pythonCurrentDeltaBytes": None,
+        "pythonPeakBytes": snapshot.python_peak_bytes,
+        "processMaxRssStartBytes": snapshot.process_max_rss_bytes,
+        "processMaxRssEndBytes": None,
+        "processMaxRssDeltaBytes": None,
+    }
 
 
 @contextmanager
