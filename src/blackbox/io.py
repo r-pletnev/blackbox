@@ -1,15 +1,15 @@
 import hashlib
-import io
 import importlib
 import inspect
+import io
 import json
 import pickle
 import re
 import subprocess
 import sys
 import warnings
-from contextlib import contextmanager
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -200,12 +200,12 @@ def _load_dill_file_with_options(
     kwargs = {} if ignore is None else {"ignore": ignore}
     if not allow_missing_filehandles:
         with Path(path).open("rb") as f:
-            return serializer_module.load(f, **kwargs)  # noqa: S301
+            return serializer_module.load(f, **kwargs)
 
     dill_impl = getattr(serializer_module, "_dill", None)
     if dill_impl is None or not hasattr(dill_impl, "_create_filehandle"):
         with Path(path).open("rb") as f:
-            return serializer_module.load(f, **kwargs)  # noqa: S301
+            return serializer_module.load(f, **kwargs)
 
     original_create_filehandle = dill_impl._create_filehandle
 
@@ -254,7 +254,7 @@ def _load_dill_file_with_options(
     dill_impl._create_filehandle = _patched_create_filehandle
     try:
         with Path(path).open("rb") as f:
-            return serializer_module.load(f, **kwargs)  # noqa: S301
+            return serializer_module.load(f, **kwargs)
     finally:
         dill_impl._create_filehandle = original_create_filehandle
 
@@ -552,11 +552,13 @@ def _apply_sanitize_hooks(
 
 
 def _fallback_unserializable_marker(obj: Any, reason: str) -> dict[str, Any]:
+    type_name = type(obj).__name__
+    module_name = type(obj).__module__
     return {
         "__blackbox_unserializable__": True,
-        "type": type(obj).__name__,
-        "module": type(obj).__module__,
-        "repr": repr(obj),
+        "type": type_name,
+        "module": module_name,
+        "repr": f"<{module_name}.{type_name}>",
         "reason": reason,
     }
 
@@ -565,6 +567,15 @@ def _object_module_name(obj: Any) -> str | None:
     if inspect.isfunction(obj) or inspect.ismethod(obj) or inspect.isclass(obj):
         return getattr(obj, "__module__", None)
     return getattr(type(obj), "__module__", None)
+
+
+def _must_not_probe_for_serialization(obj: Any) -> bool:
+    """Return whether pickling this live resource may affect its owner process."""
+    module_name = _object_module_name(obj) or ""
+    return module_name == "psycopg2.extensions" and type(obj).__name__ in {
+        "connection",
+        "cursor",
+    }
 
 
 def _mapping_items(obj: Mapping) -> Any:
@@ -621,6 +632,8 @@ def _contains_runtime_local_objects(
     module_name = _object_module_name(obj)
     if module_name == "__main__":
         return True
+    if _must_not_probe_for_serialization(obj):
+        return True
 
     obj_id = id(obj)
     if obj_id in _seen:
@@ -645,10 +658,11 @@ def _contains_runtime_local_objects(
         if isinstance(obj, (tuple, list, set, frozenset)):
             return any(_contains_runtime_local_objects(item, _seen) for item in obj)
 
-        if hasattr(obj, "__dict__") and isinstance(obj.__dict__, dict):
+        attributes = getattr(obj, "__dict__", None)
+        if isinstance(attributes, dict):
             return any(
-                _contains_runtime_local_objects(value, _seen)
-                for value in obj.__dict__.values()
+                _must_not_probe_for_serialization(value)
+                for value in attributes.values()
             )
 
         return False
@@ -767,15 +781,6 @@ def _to_plain_data(
                 for index, item in enumerate(obj)
             ]
 
-        if hasattr(obj, "__dict__"):
-            return {
-                "__object__": type(obj).__name__,
-                **{
-                    str(key): _to_plain_data(value, _seen, path=f"{path}.{key}")
-                    for key, value in obj.__dict__.items()
-                },
-            }
-
         return _fallback_unserializable_marker(
             obj,
             "converted to plain-data fallback because the sanitized payload remained unserializable",
@@ -827,6 +832,21 @@ def _sanitize_for_pickle(
             path=path,
         )
 
+    if _must_not_probe_for_serialization(obj):
+        reason = "live database connection or cursor is excluded from serialization"
+        issue = _issue_record(
+            path,
+            obj,
+            reason=reason,
+            action="stored fallback marker without probing the resource",
+        )
+        _report_issue(
+            issue,
+            issues=issues,
+            on_serialize_error=on_serialize_error,
+        )
+        return _fallback_unserializable_marker(obj, reason)
+
     if isinstance(obj, io.TextIOWrapper):
         return {
             "__file_handle__": True,
@@ -863,7 +883,8 @@ def _sanitize_for_pickle(
     if _contains_runtime_local_objects(obj):
         serializable = False
         serialize_reason = (
-            "contains objects from __main__, which are not portable across loading contexts"
+            "contains runtime-local objects or live resources that are not portable "
+            "across loading contexts"
         )
     else:
         serializable, serialize_reason = _try_serialize(obj, serializer=serializer)
@@ -954,23 +975,6 @@ def _sanitize_for_pickle(
                 for index, item in enumerate(obj)
             ]
 
-        if hasattr(obj, "__dict__"):
-            return {
-                "__object__": type(obj).__name__,
-                **{
-                    k: _sanitize_for_pickle(
-                        v,
-                        _seen,
-                        serializer=serializer,
-                        sanitize_hooks=sanitize_hooks,
-                        on_serialize_error=on_serialize_error,
-                        issues=issues,
-                        path=f"{path}.{k}",
-                    )
-                    for k, v in obj.__dict__.items()
-                },
-            }
-
         reason = serialize_reason or "object is not serializable"
         issue = _issue_record(
             path,
@@ -984,6 +988,7 @@ def _sanitize_for_pickle(
             on_serialize_error=on_serialize_error,
         )
         return _fallback_unserializable_marker(obj, reason)
+
     finally:
         _seen.discard(obj_id)
 
@@ -1030,7 +1035,7 @@ def load_pickle(
 
     serializer_module = _get_serializer_module(serializer)
     with Path(path).open("rb") as f:
-        return serializer_module.load(f)  # noqa: S301
+        return serializer_module.load(f)
 
 
 def load_json(path: str) -> Any:
