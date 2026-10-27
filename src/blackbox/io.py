@@ -435,9 +435,12 @@ def _neutralize_runtime_bound_objects(
             return obj
 
         if isinstance(obj, Mapping):
-            for key, value in list(obj.items()):
-                _neutralize_runtime_bound_objects(key, _seen)
-                _neutralize_runtime_bound_objects(value, _seen)
+            for key, value in list(_mapping_items(obj)):
+                try:
+                    _neutralize_runtime_bound_objects(key, _seen)
+                    _neutralize_runtime_bound_objects(value, _seen)
+                except Exception:
+                    continue
             return obj
 
         if isinstance(obj, (list, tuple, set, frozenset)):
@@ -564,6 +567,47 @@ def _object_module_name(obj: Any) -> str | None:
     return getattr(type(obj), "__module__", None)
 
 
+def _mapping_items(obj: Mapping) -> Any:
+    """Iterate a mapping without letting one broken item abort a snapshot."""
+    try:
+        iterator = iter(obj.items())
+    except Exception as exc:
+        yield _mapping_error_key(exc), None
+        return
+
+    while True:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return
+        except Exception as exc:
+            yield _mapping_error_key(exc), None
+            return
+
+        try:
+            key, value = item
+        except Exception as exc:
+            yield _mapping_error_key(exc), None
+            continue
+        yield key, value
+
+
+def _mapping_error_key(exc: Exception, *, key: Any = NOT_HANDLED) -> str:
+    try:
+        message = str(exc)
+    except Exception:
+        message = "<unprintable exception>"
+
+    if key is NOT_HANDLED:
+        item = ""
+    else:
+        try:
+            item = f" while processing {key!r}"
+        except Exception:
+            item = f" while processing <{type(key).__name__}>"
+    return f"__blackbox_mapping_error__{item}: {type(exc).__name__}: {message}"
+
+
 def _contains_runtime_local_objects(
     obj: Any,
     _seen: set[int] | None = None,
@@ -585,11 +629,18 @@ def _contains_runtime_local_objects(
     _seen.add(obj_id)
     try:
         if isinstance(obj, Mapping):
-            return any(
-                _contains_runtime_local_objects(key, _seen)
-                or _contains_runtime_local_objects(value, _seen)
-                for key, value in obj.items()
-            )
+            for key, value in _mapping_items(obj):
+                if isinstance(key, str) and key.startswith("__blackbox_mapping_error__:"):
+                    return True
+                try:
+                    contains_runtime_locals = _contains_runtime_local_objects(
+                        key, _seen
+                    ) or _contains_runtime_local_objects(value, _seen)
+                except Exception:
+                    return True
+                if contains_runtime_locals:
+                    return True
+            return False
 
         if isinstance(obj, (tuple, list, set, frozenset)):
             return any(_contains_runtime_local_objects(item, _seen) for item in obj)
@@ -683,12 +734,19 @@ def _to_plain_data(
 
         if isinstance(obj, Mapping):
             plain: dict[str, Any] = {}
-            for key, value in obj.items():
-                if isinstance(key, (str, int, float, bool)) or key is None:
-                    plain_key = str(key)
-                else:
-                    plain_key = repr(_to_plain_data(key, _seen, path=f"{path}[key]"))
-                plain[plain_key] = _to_plain_data(value, _seen, path=f"{path}[{plain_key!r}]")
+            for key, value in _mapping_items(obj):
+                try:
+                    if isinstance(key, (str, int, float, bool)) or key is None:
+                        plain_key = str(key)
+                    else:
+                        plain_key = repr(
+                            _to_plain_data(key, _seen, path=f"{path}[key]")
+                        )
+                    plain[plain_key] = _to_plain_data(
+                        value, _seen, path=f"{path}[{plain_key!r}]"
+                    )
+                except Exception as exc:
+                    plain[_mapping_error_key(exc, key=key)] = None
             return plain
 
         if isinstance(obj, tuple):
@@ -815,26 +873,30 @@ def _sanitize_for_pickle(
     _seen.add(obj_id)
     try:
         if isinstance(obj, Mapping):
-            return {
-                _normalize_mapping_key(
-                    k,
-                    _seen,
-                    serializer=serializer,
-                    sanitize_hooks=sanitize_hooks,
-                    on_serialize_error=on_serialize_error,
-                    issues=issues,
-                    path=f"{path}[key:{k!r}]",
-                ): _sanitize_for_pickle(
-                    v,
-                    _seen,
-                    serializer=serializer,
-                    sanitize_hooks=sanitize_hooks,
-                    on_serialize_error=on_serialize_error,
-                    issues=issues,
-                    path=f"{path}[{k!r}]",
-                )
-                for k, v in obj.items()
-            }
+            sanitized: dict[Any, Any] = {}
+            for key, value in _mapping_items(obj):
+                try:
+                    sanitized_key = _normalize_mapping_key(
+                        key,
+                        _seen,
+                        serializer=serializer,
+                        sanitize_hooks=sanitize_hooks,
+                        on_serialize_error=on_serialize_error,
+                        issues=issues,
+                        path=f"{path}[key:{key!r}]",
+                    )
+                    sanitized[sanitized_key] = _sanitize_for_pickle(
+                        value,
+                        _seen,
+                        serializer=serializer,
+                        sanitize_hooks=sanitize_hooks,
+                        on_serialize_error=on_serialize_error,
+                        issues=issues,
+                        path=f"{path}[{key!r}]",
+                    )
+                except Exception as exc:
+                    sanitized[_mapping_error_key(exc, key=key)] = None
+            return sanitized
 
         if isinstance(obj, tuple):
             return tuple(
