@@ -435,9 +435,13 @@ def _neutralize_runtime_bound_objects(
             return obj
 
         if isinstance(obj, Mapping):
-            for key, value in list(obj.items()):
-                _neutralize_runtime_bound_objects(key, _seen)
-                _neutralize_runtime_bound_objects(value, _seen)
+            errors: list[Exception] = []
+            for key, value in list(_mapping_items_safe(obj, errors)):
+                try:
+                    _neutralize_runtime_bound_objects(key, _seen)
+                    _neutralize_runtime_bound_objects(value, _seen)
+                except Exception:
+                    continue
             return obj
 
         if isinstance(obj, (list, tuple, set, frozenset)):
@@ -548,14 +552,57 @@ def _apply_sanitize_hooks(
     return NOT_HANDLED
 
 
+def _safe_repr(obj: Any) -> str:
+    try:
+        return repr(obj)
+    except Exception:
+        return f"<{type(obj).__module__}.{type(obj).__name__} (repr failed)>"
+
+
 def _fallback_unserializable_marker(obj: Any, reason: str) -> dict[str, Any]:
     return {
         "__blackbox_unserializable__": True,
         "type": type(obj).__name__,
         "module": type(obj).__module__,
-        "repr": repr(obj),
+        "repr": _safe_repr(obj),
         "reason": reason,
     }
+
+
+_MAPPING_ERROR_KEY = "__blackbox_mapping_error__"
+
+
+def _mapping_items_safe(obj: Mapping, errors: list[Exception]):
+    """Yield mapping items, recording iteration failures instead of raising."""
+    try:
+        iterator = iter(obj.items())
+    except Exception as exc:
+        errors.append(exc)
+        return
+
+    while True:
+        try:
+            key, value = next(iterator)
+        except StopIteration:
+            return
+        except Exception as exc:
+            errors.append(exc)
+            return
+        yield key, value
+
+
+def _mapping_error_reason(obj: Any, errors: list[Exception]) -> str:
+    details: list[str] = []
+    for exc in errors:
+        try:
+            message = str(exc)
+        except Exception:
+            message = "<unprintable exception>"
+        details.append(f"{type(exc).__name__}: {message}")
+    return (
+        f"mapping iteration failed for {type(obj).__module__}.{type(obj).__name__}: "
+        + "; ".join(details)
+    )
 
 
 def _object_module_name(obj: Any) -> str | None:
@@ -585,11 +632,16 @@ def _contains_runtime_local_objects(
     _seen.add(obj_id)
     try:
         if isinstance(obj, Mapping):
-            return any(
-                _contains_runtime_local_objects(key, _seen)
-                or _contains_runtime_local_objects(value, _seen)
-                for key, value in obj.items()
-            )
+            errors: list[Exception] = []
+            for key, value in _mapping_items_safe(obj, errors):
+                try:
+                    if _contains_runtime_local_objects(
+                        key, _seen
+                    ) or _contains_runtime_local_objects(value, _seen):
+                        return True
+                except Exception:
+                    return True
+            return bool(errors)
 
         if isinstance(obj, (tuple, list, set, frozenset)):
             return any(_contains_runtime_local_objects(item, _seen) for item in obj)
@@ -683,12 +735,27 @@ def _to_plain_data(
 
         if isinstance(obj, Mapping):
             plain: dict[str, Any] = {}
-            for key, value in obj.items():
-                if isinstance(key, (str, int, float, bool)) or key is None:
-                    plain_key = str(key)
-                else:
-                    plain_key = repr(_to_plain_data(key, _seen, path=f"{path}[key]"))
-                plain[plain_key] = _to_plain_data(value, _seen, path=f"{path}[{plain_key!r}]")
+            errors: list[Exception] = []
+            for key, value in _mapping_items_safe(obj, errors):
+                try:
+                    if isinstance(key, (str, int, float, bool)) or key is None:
+                        plain_key = str(key)
+                    else:
+                        plain_key = repr(
+                            _to_plain_data(key, _seen, path=f"{path}[key]")
+                        )
+                    plain[plain_key] = _to_plain_data(
+                        value, _seen, path=f"{path}[{plain_key!r}]"
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+            if errors:
+                reason = _mapping_error_reason(obj, errors)
+                if not plain:
+                    return _fallback_unserializable_marker(obj, reason)
+                plain[_MAPPING_ERROR_KEY] = _fallback_unserializable_marker(
+                    obj, reason
+                )
             return plain
 
         if isinstance(obj, tuple):
@@ -802,11 +869,17 @@ def _sanitize_for_pickle(
             "members": list(obj.__members__.keys()),
         }
 
-    if _contains_runtime_local_objects(obj):
-        serializable = False
+    try:
+        contains_runtime_local_objects = _contains_runtime_local_objects(obj)
+    except Exception as exc:
+        contains_runtime_local_objects = True
+        serialize_reason = f"runtime-local scan failed: {type(exc).__name__}: {exc}"
+    else:
         serialize_reason = (
             "contains objects from __main__, which are not portable across loading contexts"
         )
+    if contains_runtime_local_objects:
+        serializable = False
     else:
         serializable, serialize_reason = _try_serialize(obj, serializer=serializer)
     if serializable:
@@ -815,26 +888,50 @@ def _sanitize_for_pickle(
     _seen.add(obj_id)
     try:
         if isinstance(obj, Mapping):
-            return {
-                _normalize_mapping_key(
-                    k,
-                    _seen,
-                    serializer=serializer,
-                    sanitize_hooks=sanitize_hooks,
-                    on_serialize_error=on_serialize_error,
-                    issues=issues,
-                    path=f"{path}[key:{k!r}]",
-                ): _sanitize_for_pickle(
-                    v,
-                    _seen,
-                    serializer=serializer,
-                    sanitize_hooks=sanitize_hooks,
-                    on_serialize_error=on_serialize_error,
-                    issues=issues,
-                    path=f"{path}[{k!r}]",
+            errors: list[Exception] = []
+            sanitized: dict[Any, Any] = {}
+            for key, value in _mapping_items_safe(obj, errors):
+                try:
+                    sanitized_key = _normalize_mapping_key(
+                        key,
+                        _seen,
+                        serializer=serializer,
+                        sanitize_hooks=sanitize_hooks,
+                        on_serialize_error=on_serialize_error,
+                        issues=issues,
+                        path=f"{path}[key:{key!r}]",
+                    )
+                    sanitized[sanitized_key] = _sanitize_for_pickle(
+                        value,
+                        _seen,
+                        serializer=serializer,
+                        sanitize_hooks=sanitize_hooks,
+                        on_serialize_error=on_serialize_error,
+                        issues=issues,
+                        path=f"{path}[{key!r}]",
+                    )
+                except Exception as exc:
+                    if on_serialize_error == "raise":
+                        raise
+                    errors.append(exc)
+            if errors:
+                reason = _mapping_error_reason(obj, errors)
+                action = (
+                    "stored fallback marker"
+                    if not sanitized
+                    else "stored partial mapping with error marker"
                 )
-                for k, v in obj.items()
-            }
+                _report_issue(
+                    _issue_record(path, obj, reason=reason, action=action),
+                    issues=issues,
+                    on_serialize_error=on_serialize_error,
+                )
+                if not sanitized:
+                    return _fallback_unserializable_marker(obj, reason)
+                sanitized[_MAPPING_ERROR_KEY] = _fallback_unserializable_marker(
+                    obj, reason
+                )
+            return sanitized
 
         if isinstance(obj, tuple):
             return tuple(
