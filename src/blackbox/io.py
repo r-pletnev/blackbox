@@ -17,6 +17,7 @@ NOT_HANDLED = object()
 _MISSING_MAIN_ATTR_RE = re.compile(r"Can't get attribute '([^']+)' on <module '__main__'")
 _MISSING_FILE_RE = re.compile(r"\[Errno 2\] No such file or directory: '([^']+)'")
 _MP_CONNECTION_DEL_GUARD_INSTALLED = False
+_MAX_INTROSPECTION_DEPTH = 100
 
 
 def _get_serializer_module(serializer: str):
@@ -405,11 +406,19 @@ def _load_dill_with_fallbacks(path: str, *, import_roots: list[str] | None = Non
 def _neutralize_runtime_bound_objects(
     obj: Any,
     _seen: set[int] | None = None,
+    *,
+    _depth: int = 0,
 ) -> Any:
     if _seen is None:
         _seen = set()
 
     if obj is None or isinstance(obj, (bool, int, float, str, bytes)):
+        return obj
+
+    if _depth >= _MAX_INTROSPECTION_DEPTH:
+        return obj
+
+    if inspect.ismodule(obj) or _must_not_probe_for_serialization(obj):
         return obj
 
     obj_id = id(obj)
@@ -438,20 +447,24 @@ def _neutralize_runtime_bound_objects(
             errors: list[Exception] = []
             for key, value in list(_mapping_items_safe(obj, errors)):
                 try:
-                    _neutralize_runtime_bound_objects(key, _seen)
-                    _neutralize_runtime_bound_objects(value, _seen)
+                    _neutralize_runtime_bound_objects(
+                        key, _seen, _depth=_depth + 1
+                    )
+                    _neutralize_runtime_bound_objects(
+                        value, _seen, _depth=_depth + 1
+                    )
                 except Exception:
                     continue
             return obj
 
         if isinstance(obj, (list, tuple, set, frozenset)):
             for item in obj:
-                _neutralize_runtime_bound_objects(item, _seen)
+                _neutralize_runtime_bound_objects(item, _seen, _depth=_depth + 1)
             return obj
 
         if hasattr(obj, "__dict__") and isinstance(getattr(obj, "__dict__", None), dict):
             for value in obj.__dict__.values():
-                _neutralize_runtime_bound_objects(value, _seen)
+                _neutralize_runtime_bound_objects(value, _seen, _depth=_depth + 1)
             return obj
 
         return obj
@@ -553,6 +566,8 @@ def _apply_sanitize_hooks(
 
 
 def _safe_repr(obj: Any) -> str:
+    if _must_not_probe_for_serialization(obj):
+        return f"<{type(obj).__module__}.{type(obj).__name__}>"
     try:
         return repr(obj)
     except Exception:
@@ -611,9 +626,20 @@ def _object_module_name(obj: Any) -> str | None:
     return getattr(type(obj), "__module__", None)
 
 
+def _must_not_probe_for_serialization(obj: Any) -> bool:
+    """Return whether probing this live resource may affect its owner process."""
+    module_name = _object_module_name(obj) or ""
+    return module_name == "psycopg2.extensions" and type(obj).__name__ in {
+        "connection",
+        "cursor",
+    }
+
+
 def _contains_runtime_local_objects(
     obj: Any,
     _seen: set[int] | None = None,
+    *,
+    _depth: int = 0,
 ) -> bool:
     if _seen is None:
         _seen = set()
@@ -621,9 +647,18 @@ def _contains_runtime_local_objects(
     if obj is None or isinstance(obj, (bool, int, float, str, bytes)):
         return False
 
+    if _depth >= _MAX_INTROSPECTION_DEPTH:
+        return True
+
     module_name = _object_module_name(obj)
     if module_name == "__main__":
         return True
+
+    if _must_not_probe_for_serialization(obj):
+        return True
+
+    if inspect.ismodule(obj):
+        return getattr(obj, "__name__", None) == "__main__"
 
     obj_id = id(obj)
     if obj_id in _seen:
@@ -636,19 +671,24 @@ def _contains_runtime_local_objects(
             for key, value in _mapping_items_safe(obj, errors):
                 try:
                     if _contains_runtime_local_objects(
-                        key, _seen
-                    ) or _contains_runtime_local_objects(value, _seen):
+                        key, _seen, _depth=_depth + 1
+                    ) or _contains_runtime_local_objects(
+                        value, _seen, _depth=_depth + 1
+                    ):
                         return True
                 except Exception:
                     return True
             return bool(errors)
 
         if isinstance(obj, (tuple, list, set, frozenset)):
-            return any(_contains_runtime_local_objects(item, _seen) for item in obj)
+            return any(
+                _contains_runtime_local_objects(item, _seen, _depth=_depth + 1)
+                for item in obj
+            )
 
         if hasattr(obj, "__dict__") and isinstance(obj.__dict__, dict):
             return any(
-                _contains_runtime_local_objects(value, _seen)
+                _contains_runtime_local_objects(value, _seen, _depth=_depth + 1)
                 for value in obj.__dict__.values()
             )
 
@@ -666,6 +706,7 @@ def _normalize_mapping_key(
     on_serialize_error: str,
     issues: list[dict[str, Any]] | None,
     path: str,
+    _depth: int = 0,
 ) -> Any:
     if key is None or isinstance(key, (bool, int, float, str, bytes)):
         return key
@@ -678,6 +719,7 @@ def _normalize_mapping_key(
         on_serialize_error=on_serialize_error,
         issues=issues,
         path=path,
+        _depth=_depth,
     )
     try:
         hash(sanitized_key)
@@ -691,6 +733,7 @@ def _to_plain_data(
     _seen: set[int] | None = None,
     *,
     path: str = "root",
+    _depth: int = 0,
 ) -> Any:
     """Convert an arbitrary object graph to plain Python builtins."""
     import enum
@@ -701,6 +744,24 @@ def _to_plain_data(
 
     if obj is None or isinstance(obj, (bool, int, float, str, bytes)):
         return obj
+
+    if _depth >= _MAX_INTROSPECTION_DEPTH:
+        return _fallback_unserializable_marker(
+            obj,
+            f"traversal depth limit ({_MAX_INTROSPECTION_DEPTH}) exceeded",
+        )
+
+    if _must_not_probe_for_serialization(obj):
+        return _fallback_unserializable_marker(
+            obj,
+            "live database connection or cursor is excluded from serialization",
+        )
+
+    if inspect.ismodule(obj):
+        return _fallback_unserializable_marker(
+            obj,
+            "module object cannot be converted to plain data",
+        )
 
     obj_id = id(obj)
     if obj_id in _seen:
@@ -722,7 +783,9 @@ def _to_plain_data(
                 "class": type(obj).__name__,
                 "module": type(obj).__module__,
                 "name": obj.name,
-                "value": _to_plain_data(obj.value, _seen, path=f"{path}.value"),
+                "value": _to_plain_data(
+                    obj.value, _seen, path=f"{path}.value", _depth=_depth + 1
+                ),
             }
 
         if isinstance(obj, enum.EnumMeta):
@@ -742,10 +805,15 @@ def _to_plain_data(
                         plain_key = str(key)
                     else:
                         plain_key = repr(
-                            _to_plain_data(key, _seen, path=f"{path}[key]")
+                            _to_plain_data(
+                                key, _seen, path=f"{path}[key]", _depth=_depth + 1
+                            )
                         )
                     plain[plain_key] = _to_plain_data(
-                        value, _seen, path=f"{path}[{plain_key!r}]"
+                        value,
+                        _seen,
+                        path=f"{path}[{plain_key!r}]",
+                        _depth=_depth + 1,
                     )
                 except Exception as exc:
                     errors.append(exc)
@@ -760,19 +828,25 @@ def _to_plain_data(
 
         if isinstance(obj, tuple):
             return [
-                _to_plain_data(item, _seen, path=f"{path}[{index}]")
+                _to_plain_data(
+                    item, _seen, path=f"{path}[{index}]", _depth=_depth + 1
+                )
                 for index, item in enumerate(obj)
             ]
 
         if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
             return [
-                _to_plain_data(item, _seen, path=f"{path}[{index}]")
+                _to_plain_data(
+                    item, _seen, path=f"{path}[{index}]", _depth=_depth + 1
+                )
                 for index, item in enumerate(obj)
             ]
 
         if isinstance(obj, (set, frozenset)):
             return [
-                _to_plain_data(item, _seen, path=f"{path}[{index}]")
+                _to_plain_data(
+                    item, _seen, path=f"{path}[{index}]", _depth=_depth + 1
+                )
                 for index, item in enumerate(obj)
             ]
 
@@ -780,7 +854,9 @@ def _to_plain_data(
             return {
                 "__object__": type(obj).__name__,
                 **{
-                    str(key): _to_plain_data(value, _seen, path=f"{path}.{key}")
+                    str(key): _to_plain_data(
+                        value, _seen, path=f"{path}.{key}", _depth=_depth + 1
+                    )
                     for key, value in obj.__dict__.items()
                 },
             }
@@ -802,6 +878,7 @@ def _sanitize_for_pickle(
     on_serialize_error: str = "warn",
     issues: list[dict[str, Any]] | None = None,
     path: str = "root",
+    _depth: int = 0,
 ) -> Any:
     """Replace unserializable objects with serializable representations."""
     import enum
@@ -834,6 +911,7 @@ def _sanitize_for_pickle(
             on_serialize_error=on_serialize_error,
             issues=issues,
             path=path,
+            _depth=_depth,
         )
 
     if isinstance(obj, io.TextIOWrapper):
@@ -858,6 +936,7 @@ def _sanitize_for_pickle(
                 on_serialize_error=on_serialize_error,
                 issues=issues,
                 path=f"{path}.value",
+                _depth=_depth + 1,
             ),
         }
 
@@ -868,6 +947,36 @@ def _sanitize_for_pickle(
             "module": obj.__module__,
             "members": list(obj.__members__.keys()),
         }
+
+    if _must_not_probe_for_serialization(obj):
+        reason = "live database connection or cursor is excluded from serialization"
+        issue = _issue_record(
+            path,
+            obj,
+            reason=reason,
+            action="stored fallback marker without probing the resource",
+        )
+        _report_issue(
+            issue,
+            issues=issues,
+            on_serialize_error=on_serialize_error,
+        )
+        return _fallback_unserializable_marker(obj, reason)
+
+    if _depth >= _MAX_INTROSPECTION_DEPTH:
+        reason = f"traversal depth limit ({_MAX_INTROSPECTION_DEPTH}) exceeded"
+        issue = _issue_record(
+            path,
+            obj,
+            reason=reason,
+            action="stored fallback marker",
+        )
+        _report_issue(
+            issue,
+            issues=issues,
+            on_serialize_error=on_serialize_error,
+        )
+        return _fallback_unserializable_marker(obj, reason)
 
     try:
         contains_runtime_local_objects = _contains_runtime_local_objects(obj)
@@ -887,6 +996,21 @@ def _sanitize_for_pickle(
 
     _seen.add(obj_id)
     try:
+        if inspect.ismodule(obj):
+            reason = "module object remained unserializable after direct serialization check"
+            issue = _issue_record(
+                path,
+                obj,
+                reason=reason,
+                action="stored fallback marker",
+            )
+            _report_issue(
+                issue,
+                issues=issues,
+                on_serialize_error=on_serialize_error,
+            )
+            return _fallback_unserializable_marker(obj, reason)
+
         if isinstance(obj, Mapping):
             errors: list[Exception] = []
             sanitized: dict[Any, Any] = {}
@@ -900,6 +1024,7 @@ def _sanitize_for_pickle(
                         on_serialize_error=on_serialize_error,
                         issues=issues,
                         path=f"{path}[key:{key!r}]",
+                        _depth=_depth + 1,
                     )
                     sanitized[sanitized_key] = _sanitize_for_pickle(
                         value,
@@ -909,6 +1034,7 @@ def _sanitize_for_pickle(
                         on_serialize_error=on_serialize_error,
                         issues=issues,
                         path=f"{path}[{key!r}]",
+                        _depth=_depth + 1,
                     )
                 except Exception as exc:
                     if on_serialize_error == "raise":
@@ -943,6 +1069,7 @@ def _sanitize_for_pickle(
                     on_serialize_error=on_serialize_error,
                     issues=issues,
                     path=f"{path}[{index}]",
+                    _depth=_depth + 1,
                 )
                 for index, item in enumerate(obj)
             )
@@ -957,6 +1084,7 @@ def _sanitize_for_pickle(
                     on_serialize_error=on_serialize_error,
                     issues=issues,
                     path=f"{path}[{index}]",
+                    _depth=_depth + 1,
                 )
                 for index, item in enumerate(obj)
             )
@@ -971,6 +1099,7 @@ def _sanitize_for_pickle(
                     on_serialize_error=on_serialize_error,
                     issues=issues,
                     path=f"{path}[{index}]",
+                    _depth=_depth + 1,
                 )
                 for index, item in enumerate(obj)
             ]
@@ -985,6 +1114,7 @@ def _sanitize_for_pickle(
                     on_serialize_error=on_serialize_error,
                     issues=issues,
                     path=f"{path}[{index}]",
+                    _depth=_depth + 1,
                 )
                 for index, item in enumerate(obj)
             ]
@@ -1001,6 +1131,7 @@ def _sanitize_for_pickle(
                         on_serialize_error=on_serialize_error,
                         issues=issues,
                         path=f"{path}.{k}",
+                        _depth=_depth + 1,
                     )
                     for k, v in obj.__dict__.items()
                 },
