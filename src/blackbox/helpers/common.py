@@ -132,5 +132,24 @@ def smart_serialize(obj):
     return {"__type__": type_name, "__repr__": repr(obj)}
 
 
+def _json_safe_keys(value):
+    """Rewrite dict keys json cannot encode (tuples, bytes, objects) as strings."""
+    if isinstance(value, dict):
+        return {
+            key
+            if key is None or isinstance(key, (str, int, float, bool))
+            else repr(key): _json_safe_keys(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_keys(item) for item in value]
+    return value
+
+
 def dumps_json(value) -> str:
-    return json.dumps(value, ensure_ascii=False, indent=2, default=smart_serialize)
+    return json.dumps(
+        _json_safe_keys(value),
+        ensure_ascii=False,
+        indent=2,
+        default=smart_serialize,
+    )

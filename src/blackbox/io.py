@@ -829,7 +829,7 @@ def _normalize_mapping_key(
     _depth: int = 0,
     _context: _SerializationProbeContext | None = None,
 ) -> Any:
-    if key is None or isinstance(key, (bool, int, float, str, bytes)):
+    if key is None or isinstance(key, (bool, int, float, str)):
         return key
 
     sanitized_key = _sanitize_for_pickle(
@@ -843,11 +843,10 @@ def _normalize_mapping_key(
         _depth=_depth,
         _context=_context,
     )
-    try:
-        hash(sanitized_key)
-    except TypeError:
-        return repr(sanitized_key)
-    return sanitized_key
+    # Snapshot payloads are rendered through JSON, whose dict keys must be primitives.
+    if sanitized_key is None or isinstance(sanitized_key, (bool, int, float, str)):
+        return sanitized_key
+    return _safe_repr(sanitized_key)
 
 
 def _to_plain_data(
