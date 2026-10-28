@@ -5,8 +5,11 @@ import inspect
 import json
 import pickle
 import re
+import socket
+import ssl
 import subprocess
 import sys
+import time
 import warnings
 from contextlib import contextmanager
 from collections.abc import Mapping, Sequence
@@ -18,6 +21,10 @@ _MISSING_MAIN_ATTR_RE = re.compile(r"Can't get attribute '([^']+)' on <module '_
 _MISSING_FILE_RE = re.compile(r"\[Errno 2\] No such file or directory: '([^']+)'")
 _MP_CONNECTION_DEL_GUARD_INSTALLED = False
 _MAX_INTROSPECTION_DEPTH = 100
+_MAX_SERIALIZE_PROBES = 50
+_MAX_SERIALIZE_PROBE_SECONDS = 1.5
+_INITIAL_SERIALIZE_PROBE_TIMEOUT_SECONDS = 2.0
+_NESTED_SERIALIZE_PROBE_TIMEOUT_SECONDS = 0.5
 
 
 def _get_serializer_module(serializer: str):
@@ -472,17 +479,108 @@ def _neutralize_runtime_bound_objects(
         _seen.discard(obj_id)
 
 
-def _try_serialize(obj: Any, *, serializer: str = "dill") -> tuple[bool, str | None]:
+class _SerializationDeadlineExceeded(Exception):
+    """Raised when a single serialization probe exceeds its deadline."""
+
+
+class _DeadlineBuffer:
+    """File-like sink that aborts serialization once its deadline passes."""
+
+    def __init__(self, deadline: float):
+        self._deadline = deadline
+        self._chunks: list[bytes] = []
+
+    def write(self, data: bytes) -> int:
+        if time.monotonic() > self._deadline:
+            raise _SerializationDeadlineExceeded("serialization probe timed out")
+        self._chunks.append(data)
+        return len(data)
+
+    def flush(self) -> None:
+        return None
+
+
+class _SerializationProbeContext:
+    """Per-sanitize caches and probe budget shared by recursive calls."""
+
+    def __init__(self) -> None:
+        self.scan_cache: dict[int, bool] = {}
+        self.serialize_cache: dict[int, tuple[bool, str | None]] = {}
+        self.probes_left = _MAX_SERIALIZE_PROBES
+        self.deadline: float | None = None
+        self.first_probe = True
+        self.budget_reported = False
+        self.leaves_reported: set[int] = set()
+
+    def allow_probe(self) -> bool:
+        now = time.monotonic()
+        if self.deadline is None:
+            self.deadline = now + _MAX_SERIALIZE_PROBE_SECONDS
+        return self.probes_left > 0 and now < self.deadline
+
+    def next_timeout(self) -> float:
+        timeout = (
+            _INITIAL_SERIALIZE_PROBE_TIMEOUT_SECONDS
+            if self.first_probe
+            else _NESTED_SERIALIZE_PROBE_TIMEOUT_SECONDS
+        )
+        self.first_probe = False
+        self.probes_left -= 1
+        return min(timeout, max(self.deadline - time.monotonic(), 0.01))
+
+
+
+def _try_serialize(
+    obj: Any,
+    *,
+    serializer: str = "dill",
+    timeout: float | None = None,
+) -> tuple[bool, str | None]:
     """Try to serialize an object and return a structured failure reason."""
     serializer_module = _get_serializer_module(serializer)
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            serializer_module.dumps(obj)
+            if timeout is None:
+                serializer_module.dumps(obj)
+            else:
+                serializer_module.dump(
+                    obj, _DeadlineBuffer(time.monotonic() + timeout)
+                )
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
     else:
         return True, None
+
+
+def _probe_serializable(
+    obj: Any,
+    *,
+    serializer: str,
+    context: _SerializationProbeContext,
+) -> tuple[bool, str | None, bool]:
+    """Check serializability once per object, respecting the probe budget."""
+    obj_id = id(obj)
+    cached = context.serialize_cache.get(obj_id)
+    if cached is not None:
+        return cached[0], cached[1], False
+
+    if not context.allow_probe():
+        first = not context.budget_reported
+        context.budget_reported = True
+        return (
+            False,
+            "serialization probe budget exceeded",
+            first,
+        )
+
+    result = _try_serialize(
+        obj,
+        serializer=serializer,
+        timeout=context.next_timeout(),
+    )
+    context.serialize_cache[obj_id] = result
+    return result[0], result[1], False
 
 
 def _is_picklable(obj: Any, *, serializer: str = "dill") -> bool:
@@ -635,14 +733,22 @@ def _must_not_probe_for_serialization(obj: Any) -> bool:
     }
 
 
+def _is_known_unpicklable_leaf(obj: Any) -> bool:
+    """Return whether this native resource is known to be unserializable."""
+    return isinstance(obj, (ssl.SSLContext, socket.socket))
+
+
 def _contains_runtime_local_objects(
     obj: Any,
     _seen: set[int] | None = None,
     *,
     _depth: int = 0,
+    _cache: dict[int, bool] | None = None,
 ) -> bool:
     if _seen is None:
         _seen = set()
+    if _cache is None:
+        _cache = {}
 
     if obj is None or isinstance(obj, (bool, int, float, str, bytes)):
         return False
@@ -657,42 +763,56 @@ def _contains_runtime_local_objects(
     if _must_not_probe_for_serialization(obj):
         return True
 
+    if _is_known_unpicklable_leaf(obj):
+        return True
+
     if inspect.ismodule(obj):
         return getattr(obj, "__name__", None) == "__main__"
 
     obj_id = id(obj)
+    cached = _cache.get(obj_id)
+    if cached is not None:
+        return cached
+
     if obj_id in _seen:
         return False
 
     _seen.add(obj_id)
     try:
+        result = False
         if isinstance(obj, Mapping):
             errors: list[Exception] = []
             for key, value in _mapping_items_safe(obj, errors):
                 try:
                     if _contains_runtime_local_objects(
-                        key, _seen, _depth=_depth + 1
+                        key, _seen, _depth=_depth + 1, _cache=_cache
                     ) or _contains_runtime_local_objects(
-                        value, _seen, _depth=_depth + 1
+                        value, _seen, _depth=_depth + 1, _cache=_cache
                     ):
-                        return True
+                        result = True
+                        break
                 except Exception:
-                    return True
-            return bool(errors)
-
-        if isinstance(obj, (tuple, list, set, frozenset)):
-            return any(
-                _contains_runtime_local_objects(item, _seen, _depth=_depth + 1)
+                    result = True
+                    break
+            else:
+                result = bool(errors)
+        elif isinstance(obj, (tuple, list, set, frozenset)):
+            result = any(
+                _contains_runtime_local_objects(
+                    item, _seen, _depth=_depth + 1, _cache=_cache
+                )
                 for item in obj
             )
-
-        if hasattr(obj, "__dict__") and isinstance(obj.__dict__, dict):
-            return any(
-                _contains_runtime_local_objects(value, _seen, _depth=_depth + 1)
+        elif hasattr(obj, "__dict__") and isinstance(obj.__dict__, dict):
+            result = any(
+                _contains_runtime_local_objects(
+                    value, _seen, _depth=_depth + 1, _cache=_cache
+                )
                 for value in obj.__dict__.values()
             )
 
-        return False
+        _cache[obj_id] = result
+        return result
     finally:
         _seen.discard(obj_id)
 
@@ -707,6 +827,7 @@ def _normalize_mapping_key(
     issues: list[dict[str, Any]] | None,
     path: str,
     _depth: int = 0,
+    _context: _SerializationProbeContext | None = None,
 ) -> Any:
     if key is None or isinstance(key, (bool, int, float, str, bytes)):
         return key
@@ -720,6 +841,7 @@ def _normalize_mapping_key(
         issues=issues,
         path=path,
         _depth=_depth,
+        _context=_context,
     )
     try:
         hash(sanitized_key)
@@ -755,6 +877,12 @@ def _to_plain_data(
         return _fallback_unserializable_marker(
             obj,
             "live database connection or cursor is excluded from serialization",
+        )
+
+    if _is_known_unpicklable_leaf(obj):
+        return _fallback_unserializable_marker(
+            obj,
+            "native resource is excluded from serialization",
         )
 
     if inspect.ismodule(obj):
@@ -879,6 +1007,7 @@ def _sanitize_for_pickle(
     issues: list[dict[str, Any]] | None = None,
     path: str = "root",
     _depth: int = 0,
+    _context: _SerializationProbeContext | None = None,
 ) -> Any:
     """Replace unserializable objects with serializable representations."""
     import enum
@@ -886,6 +1015,8 @@ def _sanitize_for_pickle(
 
     if _seen is None:
         _seen = set()
+    if _context is None:
+        _context = _SerializationProbeContext()
 
     if obj is None or isinstance(obj, (bool, int, float, str, bytes)):
         return obj
@@ -912,6 +1043,7 @@ def _sanitize_for_pickle(
             issues=issues,
             path=path,
             _depth=_depth,
+            _context=_context,
         )
 
     if isinstance(obj, io.TextIOWrapper):
@@ -937,6 +1069,7 @@ def _sanitize_for_pickle(
                 issues=issues,
                 path=f"{path}.value",
                 _depth=_depth + 1,
+                _context=_context,
             ),
         }
 
@@ -978,8 +1111,26 @@ def _sanitize_for_pickle(
         )
         return _fallback_unserializable_marker(obj, reason)
 
+    if _is_known_unpicklable_leaf(obj):
+        reason = "native resource is excluded from serialization"
+        if obj_id not in _context.leaves_reported:
+            _context.leaves_reported.add(obj_id)
+            _report_issue(
+                _issue_record(
+                    path,
+                    obj,
+                    reason=reason,
+                    action="stored fallback marker without probing the resource",
+                ),
+                issues=issues,
+                on_serialize_error=on_serialize_error,
+            )
+        return _fallback_unserializable_marker(obj, reason)
+
     try:
-        contains_runtime_local_objects = _contains_runtime_local_objects(obj)
+        contains_runtime_local_objects = _contains_runtime_local_objects(
+            obj, _cache=_context.scan_cache
+        )
     except Exception as exc:
         contains_runtime_local_objects = True
         serialize_reason = f"runtime-local scan failed: {type(exc).__name__}: {exc}"
@@ -990,7 +1141,22 @@ def _sanitize_for_pickle(
     if contains_runtime_local_objects:
         serializable = False
     else:
-        serializable, serialize_reason = _try_serialize(obj, serializer=serializer)
+        serializable, serialize_reason, probe_exhausted = _probe_serializable(
+            obj,
+            serializer=serializer,
+            context=_context,
+        )
+        if probe_exhausted:
+            _report_issue(
+                _issue_record(
+                    path,
+                    obj,
+                    reason=serialize_reason or "serialization probe budget exceeded",
+                    action="stopped probing and switched to structural fallback",
+                ),
+                issues=issues,
+                on_serialize_error=on_serialize_error,
+            )
     if serializable:
         return obj
 
@@ -1025,6 +1191,7 @@ def _sanitize_for_pickle(
                         issues=issues,
                         path=f"{path}[key:{key!r}]",
                         _depth=_depth + 1,
+                        _context=_context,
                     )
                     sanitized[sanitized_key] = _sanitize_for_pickle(
                         value,
@@ -1035,6 +1202,7 @@ def _sanitize_for_pickle(
                         issues=issues,
                         path=f"{path}[{key!r}]",
                         _depth=_depth + 1,
+                        _context=_context,
                     )
                 except Exception as exc:
                     if on_serialize_error == "raise":
@@ -1070,6 +1238,7 @@ def _sanitize_for_pickle(
                     issues=issues,
                     path=f"{path}[{index}]",
                     _depth=_depth + 1,
+                    _context=_context,
                 )
                 for index, item in enumerate(obj)
             )
@@ -1085,6 +1254,7 @@ def _sanitize_for_pickle(
                     issues=issues,
                     path=f"{path}[{index}]",
                     _depth=_depth + 1,
+                    _context=_context,
                 )
                 for index, item in enumerate(obj)
             )
@@ -1100,6 +1270,7 @@ def _sanitize_for_pickle(
                     issues=issues,
                     path=f"{path}[{index}]",
                     _depth=_depth + 1,
+                    _context=_context,
                 )
                 for index, item in enumerate(obj)
             ]
@@ -1115,6 +1286,7 @@ def _sanitize_for_pickle(
                     issues=issues,
                     path=f"{path}[{index}]",
                     _depth=_depth + 1,
+                    _context=_context,
                 )
                 for index, item in enumerate(obj)
             ]
@@ -1132,6 +1304,7 @@ def _sanitize_for_pickle(
                         issues=issues,
                         path=f"{path}.{k}",
                         _depth=_depth + 1,
+                        _context=_context,
                     )
                     for k, v in obj.__dict__.items()
                 },
