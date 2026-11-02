@@ -25,6 +25,17 @@ _MAX_SERIALIZE_PROBES = 5
 _MAX_SERIALIZE_PROBE_SECONDS = 0.2
 _INITIAL_SERIALIZE_PROBE_TIMEOUT_SECONDS = 0.2
 _NESTED_SERIALIZE_PROBE_TIMEOUT_SECONDS = 0.1
+_PROBE_BUDGET_REASON = "serialization probe budget exceeded"
+# Modules whose instances are live clients or connections: never introspected or pickled,
+# replaced by a marker. None means every type from the module, a set limits it by type name.
+_EXCLUDED_RUNTIME_MODULES: dict[str, frozenset[str] | None] = {
+    "psycopg2.extensions": frozenset({"connection", "cursor"}),
+    "botocore.client": None,
+    "botocore.session": None,
+    "boto3.session": None,
+    "boto3.resources": None,
+}
+_EXCLUDED_RUNTIME_REASON = "live runtime resource is excluded from serialization"
 
 
 def _get_serializer_module(serializer: str):
@@ -483,6 +494,10 @@ class _SerializationDeadlineExceeded(Exception):
     """Raised when a single serialization probe exceeds its deadline."""
 
 
+class _SerializationBudgetExceeded(Exception):
+    """Raised by an object that was denied a probe, so its parent is dropped whole."""
+
+
 class _DeadlineBuffer:
     """File-like sink that aborts serialization once its deadline passes."""
 
@@ -510,6 +525,7 @@ class _SerializationProbeContext:
         self.deadline: float | None = None
         self.first_probe = True
         self.budget_reported = False
+        self.exhausted = False
         self.leaves_reported: set[int] = set()
 
     def allow_probe(self) -> bool:
@@ -568,9 +584,10 @@ def _probe_serializable(
     if not context.allow_probe():
         first = not context.budget_reported
         context.budget_reported = True
+        context.exhausted = True
         return (
             False,
-            "serialization probe budget exceeded",
+            _PROBE_BUDGET_REASON,
             first,
         )
 
@@ -725,12 +742,12 @@ def _object_module_name(obj: Any) -> str | None:
 
 
 def _must_not_probe_for_serialization(obj: Any) -> bool:
-    """Return whether probing this live resource may affect its owner process."""
+    """Return whether this live runtime resource must be replaced by a marker."""
     module_name = _object_module_name(obj) or ""
-    return module_name == "psycopg2.extensions" and type(obj).__name__ in {
-        "connection",
-        "cursor",
-    }
+    for module, type_names in _EXCLUDED_RUNTIME_MODULES.items():
+        if module_name == module or module_name.startswith(f"{module}."):
+            return type_names is None or type(obj).__name__ in type_names
+    return False
 
 
 def _is_known_unpicklable_leaf(obj: Any) -> bool:
@@ -875,7 +892,7 @@ def _to_plain_data(
     if _must_not_probe_for_serialization(obj):
         return _fallback_unserializable_marker(
             obj,
-            "live database connection or cursor is excluded from serialization",
+            _EXCLUDED_RUNTIME_REASON,
         )
 
     if _is_known_unpicklable_leaf(obj):
@@ -1024,6 +1041,11 @@ def _sanitize_for_pickle(
     if obj_id in _seen:
         return {"__recursive_ref__": type(obj).__name__}
 
+    # Once the budget is gone every remaining object is stored as one marker instead of
+    # being introspected, so the total cost stays bounded by the probe budget.
+    if _context.exhausted:
+        return _fallback_unserializable_marker(obj, _PROBE_BUDGET_REASON)
+
     hooked = _apply_sanitize_hooks(
         obj,
         path=path,
@@ -1081,7 +1103,7 @@ def _sanitize_for_pickle(
         }
 
     if _must_not_probe_for_serialization(obj):
-        reason = "live database connection or cursor is excluded from serialization"
+        reason = _EXCLUDED_RUNTIME_REASON
         issue = _issue_record(
             path,
             obj,
@@ -1150,12 +1172,15 @@ def _sanitize_for_pickle(
                 _issue_record(
                     path,
                     obj,
-                    reason=serialize_reason or "serialization probe budget exceeded",
-                    action="stopped probing and switched to structural fallback",
+                    reason=serialize_reason or _PROBE_BUDGET_REASON,
+                    action="dropped the parent object instead of introspecting it",
                 ),
                 issues=issues,
                 on_serialize_error=on_serialize_error,
             )
+            if _depth > 0:
+                raise _SerializationBudgetExceeded(_PROBE_BUDGET_REASON)
+            return _fallback_unserializable_marker(obj, _PROBE_BUDGET_REASON)
     if serializable:
         return obj
 
@@ -1203,6 +1228,8 @@ def _sanitize_for_pickle(
                         _depth=_depth + 1,
                         _context=_context,
                     )
+                except _SerializationBudgetExceeded:
+                    raise
                 except Exception as exc:
                     if on_serialize_error == "raise":
                         raise
@@ -1322,6 +1349,8 @@ def _sanitize_for_pickle(
             on_serialize_error=on_serialize_error,
         )
         return _fallback_unserializable_marker(obj, reason)
+    except _SerializationBudgetExceeded:
+        return _fallback_unserializable_marker(obj, _PROBE_BUDGET_REASON)
     finally:
         _seen.discard(obj_id)
 

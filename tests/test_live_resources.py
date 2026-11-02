@@ -8,6 +8,7 @@ from blackbox.io import (
     _MAX_INTROSPECTION_DEPTH,
     _contains_runtime_local_objects,
     _fallback_unserializable_marker,
+    _must_not_probe_for_serialization,
     _neutralize_runtime_bound_objects,
     _sanitize_for_pickle,
     _to_plain_data,
@@ -183,3 +184,54 @@ def test_decorated_call_saves_artifacts_for_live_connection(tmp_path):
     assert input_data["args"][0]["__blackbox_unserializable__"] is True
     assert output_data["result"]["__blackbox_unserializable__"] is True
     assert output_data["result"]["repr"] == "<psycopg2.extensions.connection>"
+
+
+class BaseClient:
+    """Stand-in for botocore.client.BaseClient."""
+
+    __module__ = "botocore.client"
+
+    def __init__(self):
+        self._endpoint = ExplodingDict()
+
+    def __reduce__(self):
+        raise AssertionError("runtime clients must not be probed")
+
+
+def test_runtime_client_is_marked_while_its_parent_is_dumped():
+    class App:
+        __module__ = "app.services"
+
+        def __init__(self):
+            self.s3_client = BaseClient()
+            self.name = "app"
+            self.settings = {"retries": 3}
+
+    sanitized = _sanitize_for_pickle(App(), on_serialize_error="silent")
+
+    assert sanitized["__object__"] == "App"
+    assert sanitized["name"] == "app"
+    assert sanitized["settings"] == {"retries": 3}
+    marker = sanitized["s3_client"]
+    assert marker["__blackbox_unserializable__"] is True
+    assert marker["repr"] == "<botocore.client.BaseClient>"
+    assert "excluded from serialization" in marker["reason"]
+
+
+@pytest.mark.parametrize(
+    ("module", "type_name", "excluded"),
+    [
+        ("psycopg2.extensions", "connection", True),
+        ("psycopg2.extensions", "cursor", True),
+        ("botocore.client", "BaseClient", True),
+        ("botocore.client", "EndpointCreator", True),
+        ("boto3.session", "Session", True),
+        ("boto3.resources.base", "ServiceResource", True),
+        ("psycop2.extensions", "connection", False),
+        ("botocore.parsers", "BaseClient", False),
+        ("boto3.other", "Session", False),
+    ],
+)
+def test_excluded_runtime_modules_table(module, type_name, excluded):
+    fake_type = type(type_name, (), {"__module__": module})
+    assert _must_not_probe_for_serialization(fake_type()) is excluded

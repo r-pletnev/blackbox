@@ -113,3 +113,28 @@ def test_decorated_call_saves_and_loads_graph_with_ssl_context(tmp_path):
 
     assert input_data["args"][0]["args"][0]["ctx"]["__blackbox_unserializable__"] is True
     assert output_data["result"]["args"][1]["ctx"]["__blackbox_unserializable__"] is True
+
+
+def test_parent_of_exhausted_object_is_dropped_whole(monkeypatch):
+    monkeypatch.setattr(io_module, "_MAX_SERIALIZE_PROBES", 2)
+    calls = _count_probes(monkeypatch)
+
+    payload = {"outer": {"a": SharedLeaf(), "b": SharedLeaf()}}
+    sanitized = _sanitize_for_pickle(payload, on_serialize_error="silent")
+
+    assert len(calls) == 2
+    marker = sanitized["outer"]
+    assert marker["__blackbox_unserializable__"] is True
+    assert "budget exceeded" in marker["reason"]
+
+
+def test_remaining_parameters_after_budget_are_not_introspected(monkeypatch):
+    monkeypatch.setattr(io_module, "_MAX_SERIALIZE_PROBES", 2)
+    calls = _count_probes(monkeypatch)
+
+    payload = {"bad": {"a": SharedLeaf()}, "cheap": {"value": 1}}
+    sanitized = _sanitize_for_pickle(payload, on_serialize_error="silent")
+
+    assert len(calls) == 2
+    assert sanitized["bad"]["__blackbox_unserializable__"] is True
+    assert sanitized["cheap"]["__blackbox_unserializable__"] is True
