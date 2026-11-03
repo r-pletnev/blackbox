@@ -1,7 +1,7 @@
 import hashlib
-import io
 import importlib
 import inspect
+import io
 import json
 import pickle
 import re
@@ -11,20 +11,22 @@ import subprocess
 import sys
 import time
 import warnings
-from contextlib import contextmanager
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 NOT_HANDLED = object()
-_MISSING_MAIN_ATTR_RE = re.compile(r"Can't get attribute '([^']+)' on <module '__main__'")
+_MISSING_MAIN_ATTR_RE = re.compile(
+    r"Can't get attribute '([^']+)' on <module '__main__'"
+)
 _MISSING_FILE_RE = re.compile(r"\[Errno 2\] No such file or directory: '([^']+)'")
 _MP_CONNECTION_DEL_GUARD_INSTALLED = False
-_MAX_INTROSPECTION_DEPTH = 10
-_MAX_SERIALIZE_PROBES = 5
-_MAX_SERIALIZE_PROBE_SECONDS = 0.2
-_INITIAL_SERIALIZE_PROBE_TIMEOUT_SECONDS = 0.2
-_NESTED_SERIALIZE_PROBE_TIMEOUT_SECONDS = 0.1
+_MAX_INTROSPECTION_DEPTH = 100
+_MAX_SERIALIZE_PROBES = 25
+_MAX_SERIALIZE_PROBE_SECONDS = 1
+_INITIAL_SERIALIZE_PROBE_TIMEOUT_SECONDS = 2
+_NESTED_SERIALIZE_PROBE_TIMEOUT_SECONDS = 1
 _PROBE_BUDGET_REASON = "serialization probe budget exceeded"
 # Modules whose instances are live clients or connections: never introspected or pickled,
 # replaced by a marker. None means every type from the module, a set limits it by type name.
@@ -159,7 +161,9 @@ def _snapshot_import_roots(path: str) -> list[str]:
     if isinstance(module_name, str) and module_name:
         parts = module_name.split(".")
         current = source_path.parent
-        ascend = len(parts) if source_path.name == "__init__.py" else max(len(parts) - 1, 0)
+        ascend = (
+            len(parts) if source_path.name == "__init__.py" else max(len(parts) - 1, 0)
+        )
         for _ in range(ascend):
             if current.parent == current:
                 break
@@ -219,12 +223,12 @@ def _load_dill_file_with_options(
     kwargs = {} if ignore is None else {"ignore": ignore}
     if not allow_missing_filehandles:
         with Path(path).open("rb") as f:
-            return serializer_module.load(f, **kwargs)  # noqa: S301
+            return serializer_module.load(f, **kwargs)
 
     dill_impl = getattr(serializer_module, "_dill", None)
     if dill_impl is None or not hasattr(dill_impl, "_create_filehandle"):
         with Path(path).open("rb") as f:
-            return serializer_module.load(f, **kwargs)  # noqa: S301
+            return serializer_module.load(f, **kwargs)
 
     original_create_filehandle = dill_impl._create_filehandle
 
@@ -254,7 +258,9 @@ def _load_dill_file_with_options(
                 raise
 
             if "b" in mode:
-                handle = io.BytesIO(fdata if isinstance(fdata, (bytes, bytearray)) else b"")
+                handle = io.BytesIO(
+                    fdata if isinstance(fdata, (bytes, bytearray)) else b""
+                )
             else:
                 text = fdata if isinstance(fdata, str) else ""
                 handle = io.StringIO(text)
@@ -273,7 +279,7 @@ def _load_dill_file_with_options(
     dill_impl._create_filehandle = _patched_create_filehandle
     try:
         with Path(path).open("rb") as f:
-            return serializer_module.load(f, **kwargs)  # noqa: S301
+            return serializer_module.load(f, **kwargs)
     finally:
         dill_impl._create_filehandle = original_create_filehandle
 
@@ -304,7 +310,9 @@ def _install_safe_multiprocessing_connection_guard() -> None:
     _MP_CONNECTION_DEL_GUARD_INSTALLED = True
 
 
-def _load_dill_with_fallbacks(path: str, *, import_roots: list[str] | None = None) -> Any:
+def _load_dill_with_fallbacks(
+    path: str, *, import_roots: list[str] | None = None
+) -> Any:
     serializer_module = _get_serializer_module("dill")
     import_roots = _merge_import_roots(import_roots, _snapshot_import_roots(path))
 
@@ -359,7 +367,9 @@ def _load_dill_with_fallbacks(path: str, *, import_roots: list[str] | None = Non
 
     main_module = sys.modules.get("__main__")
     if main_module is None:
-        raise RuntimeError("Unable to resolve __main__ module for dill fallback loading.")
+        raise RuntimeError(
+            "Unable to resolve __main__ module for dill fallback loading."
+        )
 
     injected_names: list[str] = []
     last_exc: Exception | None = None
@@ -411,14 +421,18 @@ def _load_dill_with_fallbacks(path: str, *, import_roots: list[str] | None = Non
         if hasattr(main_module, missing_name):
             if last_exc is not None:
                 raise last_exc
-            raise RuntimeError("dill fallback loading failed without a recoverable missing attribute.")
+            raise RuntimeError(
+                "dill fallback loading failed without a recoverable missing attribute."
+            )
 
         setattr(main_module, missing_name, _missing_runtime_type(missing_name))
         injected_names.append(missing_name)
         if len(injected_names) >= 32:
             if last_exc is not None:
                 raise last_exc
-            raise RuntimeError("Exceeded dill fallback placeholder limit while loading snapshot.")
+            raise RuntimeError(
+                "Exceeded dill fallback placeholder limit while loading snapshot."
+            )
 
 
 def _neutralize_runtime_bound_objects(
@@ -465,12 +479,8 @@ def _neutralize_runtime_bound_objects(
             errors: list[Exception] = []
             for key, value in list(_mapping_items_safe(obj, errors)):
                 try:
-                    _neutralize_runtime_bound_objects(
-                        key, _seen, _depth=_depth + 1
-                    )
-                    _neutralize_runtime_bound_objects(
-                        value, _seen, _depth=_depth + 1
-                    )
+                    _neutralize_runtime_bound_objects(key, _seen, _depth=_depth + 1)
+                    _neutralize_runtime_bound_objects(value, _seen, _depth=_depth + 1)
                 except Exception:
                     continue
             return obj
@@ -480,7 +490,9 @@ def _neutralize_runtime_bound_objects(
                 _neutralize_runtime_bound_objects(item, _seen, _depth=_depth + 1)
             return obj
 
-        if hasattr(obj, "__dict__") and isinstance(getattr(obj, "__dict__", None), dict):
+        if hasattr(obj, "__dict__") and isinstance(
+            getattr(obj, "__dict__", None), dict
+        ):
             for value in obj.__dict__.values():
                 _neutralize_runtime_bound_objects(value, _seen, _depth=_depth + 1)
             return obj
@@ -492,10 +504,6 @@ def _neutralize_runtime_bound_objects(
 
 class _SerializationDeadlineExceeded(Exception):
     """Raised when a single serialization probe exceeds its deadline."""
-
-
-class _SerializationBudgetExceeded(Exception):
-    """Raised by an object that was denied a probe, so its parent is dropped whole."""
 
 
 class _DeadlineBuffer:
@@ -545,7 +553,6 @@ class _SerializationProbeContext:
         return min(timeout, max(self.deadline - time.monotonic(), 0.01))
 
 
-
 def _try_serialize(
     obj: Any,
     *,
@@ -560,9 +567,7 @@ def _try_serialize(
             if timeout is None:
                 serializer_module.dumps(obj)
             else:
-                serializer_module.dump(
-                    obj, _DeadlineBuffer(time.monotonic() + timeout)
-                )
+                serializer_module.dump(obj, _DeadlineBuffer(time.monotonic() + timeout))
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
     else:
@@ -965,32 +970,24 @@ def _to_plain_data(
                 reason = _mapping_error_reason(obj, errors)
                 if not plain:
                     return _fallback_unserializable_marker(obj, reason)
-                plain[_MAPPING_ERROR_KEY] = _fallback_unserializable_marker(
-                    obj, reason
-                )
+                plain[_MAPPING_ERROR_KEY] = _fallback_unserializable_marker(obj, reason)
             return plain
 
         if isinstance(obj, tuple):
             return [
-                _to_plain_data(
-                    item, _seen, path=f"{path}[{index}]", _depth=_depth + 1
-                )
+                _to_plain_data(item, _seen, path=f"{path}[{index}]", _depth=_depth + 1)
                 for index, item in enumerate(obj)
             ]
 
         if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
             return [
-                _to_plain_data(
-                    item, _seen, path=f"{path}[{index}]", _depth=_depth + 1
-                )
+                _to_plain_data(item, _seen, path=f"{path}[{index}]", _depth=_depth + 1)
                 for index, item in enumerate(obj)
             ]
 
         if isinstance(obj, (set, frozenset)):
             return [
-                _to_plain_data(
-                    item, _seen, path=f"{path}[{index}]", _depth=_depth + 1
-                )
+                _to_plain_data(item, _seen, path=f"{path}[{index}]", _depth=_depth + 1)
                 for index, item in enumerate(obj)
             ]
 
@@ -1040,11 +1037,6 @@ def _sanitize_for_pickle(
     obj_id = id(obj)
     if obj_id in _seen:
         return {"__recursive_ref__": type(obj).__name__}
-
-    # Once the budget is gone every remaining object is stored as one marker instead of
-    # being introspected, so the total cost stays bounded by the probe budget.
-    if _context.exhausted:
-        return _fallback_unserializable_marker(obj, _PROBE_BUDGET_REASON)
 
     hooked = _apply_sanitize_hooks(
         obj,
@@ -1148,46 +1140,53 @@ def _sanitize_for_pickle(
             )
         return _fallback_unserializable_marker(obj, reason)
 
-    try:
-        contains_runtime_local_objects = _contains_runtime_local_objects(
-            obj, _cache=_context.scan_cache
-        )
-    except Exception as exc:
-        contains_runtime_local_objects = True
-        serialize_reason = f"runtime-local scan failed: {type(exc).__name__}: {exc}"
+    if _context.exhausted:
+        # Budget is gone, so walk structurally instead of probing: an unprobeable child
+        # then costs one marker, not the whole parent object.
+        serializable, serialize_reason = False, _PROBE_BUDGET_REASON
     else:
-        serialize_reason = (
-            "contains objects from __main__, which are not portable across loading contexts"
-        )
-    if contains_runtime_local_objects:
-        serializable = False
-    else:
-        serializable, serialize_reason, probe_exhausted = _probe_serializable(
-            obj,
-            serializer=serializer,
-            context=_context,
-        )
-        if probe_exhausted:
-            _report_issue(
-                _issue_record(
-                    path,
-                    obj,
-                    reason=serialize_reason or _PROBE_BUDGET_REASON,
-                    action="dropped the parent object instead of introspecting it",
-                ),
-                issues=issues,
-                on_serialize_error=on_serialize_error,
+        try:
+            contains_runtime_local_objects = _contains_runtime_local_objects(
+                obj, _cache=_context.scan_cache
             )
-            if _depth > 0:
-                raise _SerializationBudgetExceeded(_PROBE_BUDGET_REASON)
-            return _fallback_unserializable_marker(obj, _PROBE_BUDGET_REASON)
+        except Exception as exc:
+            contains_runtime_local_objects = True
+            serialize_reason = (
+                f"runtime-local scan failed: {type(exc).__name__}: {exc}"
+            )
+        else:
+            serialize_reason = (
+                "contains objects from __main__, which are not portable across "
+                "loading contexts"
+            )
+        if contains_runtime_local_objects:
+            serializable = False
+        else:
+            serializable, serialize_reason, probe_exhausted = _probe_serializable(
+                obj,
+                serializer=serializer,
+                context=_context,
+            )
+            if probe_exhausted:
+                _report_issue(
+                    _issue_record(
+                        path,
+                        obj,
+                        reason=serialize_reason or _PROBE_BUDGET_REASON,
+                        action="stopped probing and continued structurally",
+                    ),
+                    issues=issues,
+                    on_serialize_error=on_serialize_error,
+                )
     if serializable:
         return obj
 
     _seen.add(obj_id)
     try:
         if inspect.ismodule(obj):
-            reason = "module object remained unserializable after direct serialization check"
+            reason = (
+                "module object remained unserializable after direct serialization check"
+            )
             issue = _issue_record(
                 path,
                 obj,
@@ -1228,8 +1227,6 @@ def _sanitize_for_pickle(
                         _depth=_depth + 1,
                         _context=_context,
                     )
-                except _SerializationBudgetExceeded:
-                    raise
                 except Exception as exc:
                     if on_serialize_error == "raise":
                         raise
@@ -1349,8 +1346,6 @@ def _sanitize_for_pickle(
             on_serialize_error=on_serialize_error,
         )
         return _fallback_unserializable_marker(obj, reason)
-    except _SerializationBudgetExceeded:
-        return _fallback_unserializable_marker(obj, _PROBE_BUDGET_REASON)
     finally:
         _seen.discard(obj_id)
 
@@ -1386,7 +1381,15 @@ def load_pickle(
     if serializer == "auto":
         try:
             return load_pickle(path, serializer="dill", import_roots=import_roots)
-        except (pickle.UnpicklingError, EOFError, AttributeError, ImportError, ModuleNotFoundError, ValueError, TypeError):
+        except (
+            pickle.UnpicklingError,
+            EOFError,
+            AttributeError,
+            ImportError,
+            ModuleNotFoundError,
+            ValueError,
+            TypeError,
+        ):
             return load_pickle(path, serializer="pickle", import_roots=import_roots)
 
     if serializer == "dill":
@@ -1397,7 +1400,16 @@ def load_pickle(
 
     serializer_module = _get_serializer_module(serializer)
     with Path(path).open("rb") as f:
-        return serializer_module.load(f)  # noqa: S301
+        return serializer_module.load(f)
+    if serializer == "dill":
+        _install_safe_multiprocessing_connection_guard()
+        return _neutralize_runtime_bound_objects(
+            _load_dill_with_fallbacks(path, import_roots=list(import_roots or []))
+        )
+
+    serializer_module = _get_serializer_module(serializer)
+    with Path(path).open("rb") as f:
+        return serializer_module.load(f)
 
 
 def load_json(path: str) -> Any:

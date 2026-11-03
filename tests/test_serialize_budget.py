@@ -115,7 +115,7 @@ def test_decorated_call_saves_and_loads_graph_with_ssl_context(tmp_path):
     assert output_data["result"]["args"][1]["ctx"]["__blackbox_unserializable__"] is True
 
 
-def test_parent_of_exhausted_object_is_dropped_whole(monkeypatch):
+def test_exhausted_child_is_marked_while_its_parent_keeps_other_fields(monkeypatch):
     monkeypatch.setattr(io_module, "_MAX_SERIALIZE_PROBES", 2)
     calls = _count_probes(monkeypatch)
 
@@ -123,18 +123,44 @@ def test_parent_of_exhausted_object_is_dropped_whole(monkeypatch):
     sanitized = _sanitize_for_pickle(payload, on_serialize_error="silent")
 
     assert len(calls) == 2
-    marker = sanitized["outer"]
-    assert marker["__blackbox_unserializable__"] is True
-    assert "budget exceeded" in marker["reason"]
+    outer = sanitized["outer"]
+    assert set(outer) == {"a", "b"}
+    assert isinstance(outer["a"], dict) and isinstance(outer["b"], dict)
 
 
-def test_remaining_parameters_after_budget_are_not_introspected(monkeypatch):
+def test_parameters_after_budget_are_walked_structurally(monkeypatch):
     monkeypatch.setattr(io_module, "_MAX_SERIALIZE_PROBES", 2)
     calls = _count_probes(monkeypatch)
 
-    payload = {"bad": {"a": SharedLeaf()}, "cheap": {"value": 1}}
+    payload = {"bad": {"a": SharedLeaf(), "b": 1}, "cheap": {"value": 1}}
     sanitized = _sanitize_for_pickle(payload, on_serialize_error="silent")
 
     assert len(calls) == 2
-    assert sanitized["bad"]["__blackbox_unserializable__"] is True
-    assert sanitized["cheap"]["__blackbox_unserializable__"] is True
+    assert set(sanitized["bad"]) == {"a", "b"}
+    assert sanitized["bad"]["b"] == 1
+    assert sanitized["cheap"] == {"value": 1}
+
+
+def test_object_denied_a_probe_keeps_its_other_fields(monkeypatch):
+    monkeypatch.setattr(io_module, "_MAX_SERIALIZE_PROBES", 1)
+
+    class connection:
+        __module__ = "psycopg2.extensions"
+
+    class Service:
+        __module__ = "app.services"
+
+        def __init__(self):
+            self.conn = connection()
+            self.name = "service"
+            self.settings = {"retries": 3}
+
+    # The shared leaf burns the budget first, so Service itself is denied a probe.
+    payload = {"bad": SharedLeaf(), "self": Service()}
+    sanitized = _sanitize_for_pickle(payload, on_serialize_error="silent")
+
+    service = sanitized["self"]
+    assert service["__object__"] == "Service"
+    assert service["conn"]["__blackbox_unserializable__"] is True
+    assert service["name"] == "service"
+    assert service["settings"] == {"retries": 3}
