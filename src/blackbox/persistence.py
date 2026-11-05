@@ -69,7 +69,12 @@ class CallArtifact:
         try:
             function_source = inspect.getsource(func)
         except (OSError, TypeError):
-            function_source = None
+            # Вложенные вызовы передают заглушку вместо функции: берём исходник по код-объекту.
+            code = getattr(func, "__code__", None)
+            try:
+                function_source = inspect.getsource(code) if code is not None else None
+            except (OSError, TypeError):
+                function_source = None
         self.func = func
         self.meta = {
             "function": func.__name__,

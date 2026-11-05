@@ -19,6 +19,7 @@
 - Возможность переключиться на стандартный `pickle`
 - Отдельный легкий `meta.json` для быстрой инспекции вызова
 - Запись метаданных вызова, включая текущую git-ветку
+- Генерация самодостаточных play-скриптов из снимка (запуск без `blackbox`)
 
 ## Установка
 
@@ -366,6 +367,7 @@ value_json = read_var_from_pickle(
 - `get_result(...)` — JSON-представление результата и информация об исключении
 - `read_var_from_pickle(...)` — чтение конкретной локальной переменной из `output.pkl`
 - `create_snapshot_notebook(...)` — генерация Jupyter notebook для исследования снапшота
+- `generate_play_script(...)` — генерация самодостаточного play-скрипта для воспроизведения вызова
 - `open_result_in_repl(...)` и `open_var_in_repl(...)` — быстрый экспорт значения в интерактивную сессию
 - `import_roots=[...]` — явные корни импорта для снапшотов из другого runtime-контекста
 
@@ -377,6 +379,7 @@ python -m blackbox.helpers.get_local_vars --pickle-path /tmp/blackbox/example.py
 python -m blackbox.helpers.read_var_from_pickle --pickle-path /tmp/blackbox/example.py/add/.../output.pkl --var-name total --import-root /Users/roman/dev/my-project
 python -m blackbox.helpers.create_snapshot_notebook --snapshot-path /tmp/blackbox/example.py/add/.../ --import-root /Users/roman/dev/my-project
 python -m blackbox.helpers.create_snapshot_notebook --snapshot-path /tmp/blackbox/example.py/add/.../ --compare-with /tmp/blackbox/example.py/add-other/.../ --import-root /Users/roman/dev/my-project
+python -m blackbox.helpers.play_script /tmp/blackbox/example.py/add/.../ --output-dir ./plays
 ```
 
 Notebook generation:
@@ -421,6 +424,123 @@ When `compare_with=...` is provided, the notebook switches to compare mode and i
 - side-by-side result inspection
 - exception comparison when an exception exists in at least one snapshot
 
+## Play-скрипты
+
+Play-скрипт — это самодостаточный Python-скрипт, собранный из снимка: он
+повторяет вызов исследуемой функции с теми же аргументами и подменяет все
+вызываемые внутри функции мок-ами, которые возвращают результаты, записанные
+в снимке. Скрипт не импортирует `blackbox` и запускается обычным
+`python play_имя.py`, что удобно для отладки из редактора.
+
+### Быстрый старт
+
+```python
+from blackbox.helpers import generate_play_script
+
+path = generate_play_script(
+    "/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34"
+)
+print(path)
+# /path/to/cwd/plays/add-c000001/play_add.py
+```
+
+Запуск:
+
+```bash
+python plays/add-c000001/play_add.py
+```
+
+### Параметры
+
+```python
+generate_play_script(
+    snapshot_path,       # путь к артефакту (папке с meta.json и *.pkl) — обязательный
+    function_name=None,  # переопределить имя функции из снимка
+    function_source=None,# исходник функции, если его нет в снимке
+    output_dir=None,     # куда положить скрипт; по умолчанию cwd/plays/<функция>-<id>
+) -> Path
+```
+
+По умолчанию скрипт кладется в `plays/<имя функции>-<id>/play_<имя функции>.py`,
+где `<id>` — идентификатор вызова из снимка. Через `output_dir` путь задается явно.
+Если в снимке нет исходника функции (например, функция вложенная), он
+обязателен через `function_source`; можно также задать путь к файлу через CLI.
+
+### Что содержит скрипт
+
+- Тело исследуемой функции
+- `ARGS`/`KWARGS` — восстановленные входные аргументы из снимка
+- Мок-и для свободных функций (`helper`), вызовов через модуль (`json.loads`,
+  `os.path.join`) и методов на сохраненных объектах (`self.conn.query`);
+  каждый мок возвращает результат, записанный в снимке
+- `_record(...)` — таблица записанных результатов, из которой моки берут значения
+- `RESULT = функция(*ARGS, **KWARGS)` и печать результата
+
+Если результат вызова не найден в снимке, мок бросает `NotImplementedError`
+с именем функции и аргументами, а не подставляет произвольное значение.
+
+Пример сгенерированного скрипта:
+
+```python
+# ... служебные хелперы: RESULTS, _record, _lookup, _patch_modules ...
+_record('helper', (), {'x': 1}, 10)
+_record('helper', (), {'x': 2}, 20)
+
+def helper(*args, **kwargs):
+    return _lookup('helper', args, kwargs)
+
+FREE_NAMES = {'helper'}
+ARGS = []
+KWARGS = {'items': [1, 2, 3]}
+
+def work(items):
+    out = [helper(i) for i in items]
+    return {'sum': sum(out)}
+
+if __name__ == "__main__":
+    _bind_environment(FREE_NAMES)
+    RESULT = work(*ARGS, **KWARGS)
+    print("результат:", RESULT)
+```
+
+### Низкоуровневые функции
+
+Для кастомной сборки доступны отдельные шаги:
+
+```python
+from blackbox.helpers.play_script import (
+    build_mock_plan,    # -> list[MockPlan]: сопоставить вызовы в теле с результатами
+    find_call_sites,    # -> list[CallSite]: найти вызовы внутри исходника (AST)
+    load_snapshot,      # -> SnapshotBundle: функция, аргументы, locals, вложенные вызовы
+    render_play_script, # -> str: собрать текст скрипта из SnapshotBundle
+)
+
+bundle = load_snapshot("/tmp/blackbox/example.py/add/20260425_120102_123456_ab12cd34")
+print(bundle.function_name, sorted(bundle.locals), len(bundle.nested_calls))
+print([(s.kind, s.receiver, s.name) for s in find_call_sites(bundle.function_source)])
+print([m.describe() for m in build_mock_plan(bundle)])
+print(render_play_script(bundle)[:200])
+```
+
+### CLI
+
+```bash
+python -m blackbox.helpers.play_script /tmp/blackbox/example.py/add/.../
+python -m blackbox.helpers.play_script /tmp/blackbox/example.py/add/.../ --output-dir ./plays
+python -m blackbox.helpers.play_script /tmp/blackbox/example.py/add/.../ --function-name add --function-source ./add.py
+```
+
+Без `--output-dir`/`--function-source` модуль только печатает информацию о снимке;
+с ними — собирает play-скрипт.
+
+### Ограничения
+
+- Аргументы вызова восстанавливаются из вложенных артефактов; если вызов не
+  трассировался, мок отвечает единственным значением по имени из locals
+- Мок-и навешиваются на свободные имена, атрибуты загруженных модулей и методы
+  на объектах снимка (объект и один уровень его `__dict__`)
+- Скрипт повторяет один вызов функции, а не всю сессию
+
 ## Ограничения и замечания
 
 - Захват locals через `sys.settrace` добавляет runtime overhead
@@ -445,6 +565,7 @@ from blackbox.io import NOT_HANDLED, load_json, load_pickle
 ```python
 from blackbox.helpers import (
     create_snapshot_notebook,
+    generate_play_script,
     get_args,
     get_local_vars,
     get_result,
